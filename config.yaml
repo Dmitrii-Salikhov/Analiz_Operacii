@@ -20,6 +20,7 @@ thresholds:
 
 summary:
   default_path: "Операции сводная 2026.xlsx"
+  backup_keep: 10  # сколько .bak хранить рядом со сводной
   year: 2026
   # Форма «ХИРУРГИЧЕСКАЯ РАБОТА … 4001» справа на каждом месячном листе
   form_4001:
@@ -341,13 +342,51 @@ surgery_categories:
     name_keywords: ["биопсия", "гортан"]
 
 # Обновление с GitHub (Помощь → Проверить обновления…)
-# Создайте репозиторий и укажите owner/repo. Для приватного — токен в GITHUB_TOKEN.
 updates:
   enabled: true
   github_owner: "Dmitrii-Salikhov"
   github_repo: "Analiz_Operacii"
   branch: "main"
-  check_on_startup: false
+  check_on_startup: true
+  check_interval_days: 7   # не чаще раза в N дней
   github_token_env: "GITHUB_TOKEN"
   zip_filename: "AnalizOperacii-Windows.zip"
   sha256_filename: "AnalizOperacii-Windows.zip.sha256"
+
+# Профили отделений (путь к сводной и заметка).
+# Рубрикатор/форма 4001 сейчас общие (ЛОР). Для других отделений —
+# фильтр журнала работает; категории нужно будет добавить отдельно.
+department_profiles:
+  "Оториноларингологическое отделение":
+    summary_key: "lor"
+    rubricator: "lor"
+  "1 Хирургическое отделение":
+    summary_key: "surg1"
+    rubricator: "generic"
+  "2 Хирургическое отделение":
+    summary_key: "surg2"
+    rubricator: "generic"
+  "Терапевтическое отделение":
+    summary_key: "ther"
+    rubricator: "generic"
+  "Кардиологическое отделение":
+    summary_key: "card"
+    rubricator: "generic"
+  "Неврологическое отделение":
+    summary_key: "neuro"
+    rubricator: "generic"
+  "Педиатрическое отделение":
+    summary_key: "ped"
+    rubricator: "generic"
+  "Травматологическое отделение":
+    summary_key: "traum"
+    rubricator: "generic"
+  "Детское хирургическое отделение":
+    summary_key: "pedsurg"
+    rubricator: "generic"
+  "Дневной стационар Бутово-парк":
+    summary_key: "ds_butovo"
+    rubricator: "generic"
+  "Взрослая пол. ДНЕВНОЙ СТАЦИОНАР.":
+    summary_key: "ds_adult"
+    rubricator: "generic"

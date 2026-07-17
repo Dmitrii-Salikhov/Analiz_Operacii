@@ -158,15 +158,17 @@ class SummaryWriter:
             raise FileNotFoundError(f"Шаблон не найден: {self.template_path}")
 
         out = Path(output_path) if output_path else self.template_path
-        if backup and out.exists() and out.resolve() == self.template_path.resolve():
+        report_bak = None
+        if backup and out.exists():
             from datetime import datetime as _dt
+
+            from analyzers.backup_utils import rotate_backups
 
             stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
             bak = out.with_name(f"{out.stem}.{stamp}.bak{out.suffix}")
             shutil.copy2(out, bak)
             report_bak = str(bak)
-        else:
-            report_bak = None
+            rotate_backups(out, keep=int(self.cfg.get("backup_keep", 10)))
 
         wb = openpyxl.load_workbook(self.template_path)
         report = {

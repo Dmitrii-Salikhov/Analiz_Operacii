@@ -63,9 +63,25 @@ class KsgCatalog:
         return " | ".join(parts) if parts else code
 
     def suggest_config_line(self, code: str) -> str:
+        return self.suggest_config_snippet(code)
+
+    def suggest_config_snippet(self, code: str) -> str:
+        """Готовый черновик пункта surgery_categories для вставки в config.yaml."""
         info = self.lookup(code)
-        name = info["name"] if info else ""
-        return f'  # TODO: "{name}" → category\n  # codes: ["{code}"]'
+        name = (info["name"] if info else "") or "…"
+        # короткие слова из названия — кандидаты в name_keywords
+        words = [w.lower() for w in name.replace(",", " ").replace("(", " ").replace(")", " ").split() if len(w) > 3][
+            :4
+        ]
+        kw = ", ".join(f'"{w}"' for w in words) if words else '"…"'
+        return (
+            f'  - category: "{name[:60]}"\n'
+            f'    codes: ["{code}"]\n'
+            f'    group: "…"\n'
+            f'    line: "…"\n'
+            f"    histology: false\n"
+            f"    name_keywords: [{kw}]"
+        )
 
 
 _catalog: Optional[KsgCatalog] = None

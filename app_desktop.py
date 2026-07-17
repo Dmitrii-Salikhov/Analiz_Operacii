@@ -27,10 +27,13 @@ from analyzers.export_report import export_month_like_summary
 from analyzers.file_lock import excel_file_locked
 from analyzers.form_4001 import compute_form_4001, form_4001_preview_rows
 from analyzers.io_utils import OperationsStore, read_table
+from analyzers.problem_codes import build_problem_codes_table, format_config_draft
+from analyzers.backup_utils import list_backups, restore_backup
 from analyzers.surgery import SurgeryAnalyzer, build_summary_tables
 from analyzers.summary_writer import (
     MONTH_RU,
     SummaryWriter,
+    _as_date,
     compute_month_weeks,
     read_sheet_weeks,
 )
@@ -42,6 +45,7 @@ from analyzers.updater import (
     read_local_version,
     resolve_token,
 )
+from analyzers.write_verify import format_verify_message, verify_write_report
 from analyzers.year_template import create_year_summary, suggest_summary_path
 
 try:
@@ -104,8 +108,16 @@ class DesktopApp:
         self._preview_clipboard = ""
         self.write_weeks_var = BooleanVar(value=True)
         self.write_form_var = BooleanVar(value=True)
+        self.last_surg_dir = str(APP_DIR)
+        self.last_emk_dir = str(APP_DIR)
+        self._year_hint_key = None
+        self.loaded_department = None
+        self.summary_paths_by_dept = {}
+        self.last_update_check = ""
+        self._prev_dept = None
 
         self._apply_saved_settings()
+        self._prev_dept = self.dept_var.get()
 
         self.kpi_ops_var = StringVar(value="—")
         self.kpi_patients_var = StringVar(value="—")
@@ -123,8 +135,7 @@ class DesktopApp:
         self._load_log_into_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.log_message("Приложение готово. Нажмите «Опержурнал(ы)» для загрузки.")
-        if self.config.get("updates", {}).get("check_on_startup"):
-            self.root.after(800, lambda: self.check_updates(silent=True))
+        self.root.after(900, self._maybe_startup_update_check)
 
     def load_config(self):
         try:
@@ -140,20 +151,23 @@ class DesktopApp:
         self.root.config(menu=bar)
         file_m = Menu(bar, tearoff=0)
         file_m.add_command(label="Опержурнал(ы)…", command=self.load_surg)
+        file_m.add_command(label="Опержурналы из папки…", command=self.load_surg_folder)
         file_m.add_command(label="ЭМК…", command=self.load_emk)
         file_m.add_command(label="Сводная…", command=self.choose_summary)
         file_m.add_separator()
         file_m.add_command(label="Записать в Excel…", command=self.update_summary)
         file_m.add_command(label="Открыть Excel", command=self.open_summary_file)
+        file_m.add_command(label="Восстановить из бэкапа…", command=self.restore_summary_backup)
         file_m.add_command(label="Экспорт простого отчёта…", command=self.export_simple)
         file_m.add_command(label="Создать сводную на год…", command=self.create_year_summary_dialog)
         file_m.add_command(label="Экспорт неклассифицированных…", command=self.export_unclassified)
+        file_m.add_command(label="Экспорт проблемных кодов…", command=self.export_problem_codes)
         file_m.add_separator()
         file_m.add_command(label="Очистить", command=self.clear_store)
         file_m.add_command(label="Выход", command=self._on_close)
         bar.add_cascade(label="Файл", menu=file_m)
         help_m = Menu(bar, tearoff=0)
-        help_m.add_command(label="Проверить обновления…", command=self.check_updates)
+        help_m.add_command(label="Проверить обновления…", command=lambda: self.check_updates(force=True))
         help_m.add_command(label="О программе", command=self.show_about)
         bar.add_cascade(label="Помощь", menu=help_m)
 
@@ -178,10 +192,12 @@ class DesktopApp:
         tk.Label(toolbar, text="Действия:", font=("Helvetica", 12, "bold")).pack(side=tk.LEFT, padx=6)
         for text, cmd in (
             ("Опержурнал(ы)", self.load_surg),
+            ("Из папки…", self.load_surg_folder),
             ("ЭМК", self.load_emk),
             ("Обновить превью", self.run_analysis),
             ("Записать в Excel…", self.update_summary),
             ("Открыть Excel", self.open_summary_file),
+            ("Бэкап…", self.restore_summary_backup),
             ("Расхождения ЭМК", self.show_emk_diff),
             ("Очистить", self.clear_store),
         ):
@@ -201,6 +217,12 @@ class DesktopApp:
         dept_list = self.config["departments"]["list"]
         self.dept_combo = ttk.Combobox(top, textvariable=self.dept_var, values=dept_list, width=40, state="readonly")
         self.dept_combo.pack(side=tk.LEFT, padx=4)
+        self.dept_combo.bind("<<ComboboxSelected>>", lambda e: self._on_department_changed())
+        self.dept_hint_var = StringVar(value="")
+        tk.Label(top, textvariable=self.dept_hint_var, fg="#666", wraplength=420, justify=tk.LEFT).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        self._refresh_dept_hint()
 
         # --- KPI ---
         kpi = tk.LabelFrame(self.root, text="Сводка", padx=6, pady=4)
@@ -308,11 +330,13 @@ class DesktopApp:
         self.tab_preview_tot = tk.Frame(self.notebook)
         self.tab_preview_form = tk.Frame(self.notebook)
         self.tab_preview = self.tab_preview_cat
+        self.tab_emk = tk.Frame(self.notebook)
         self.tab_uncl = tk.Frame(self.notebook)
         self.tab_log = tk.Frame(self.notebook)
         self.notebook.add(self.tab_preview_cat, text="Превью: категории")
         self.notebook.add(self.tab_preview_tot, text="Превью: итоги")
         self.notebook.add(self.tab_preview_form, text="Превью: форма 4001")
+        self.notebook.add(self.tab_emk, text="Расхождения ЭМК")
         self.notebook.add(self.tab_uncl, text="Не классифицировано")
         self.notebook.add(self.tab_log, text="Журнал")
 
@@ -332,9 +356,28 @@ class DesktopApp:
         _btn(form_btns, "Копировать превью", self.copy_preview, side=tk.LEFT, padx=2)
         self.tree_form = self._make_tree(self.tab_preview_form)
 
+        emk_top = tk.Frame(self.tab_emk)
+        emk_top.pack(fill=tk.X, pady=2)
+        _btn(emk_top, "Обновить сверку", self.show_emk_diff, side=tk.LEFT, padx=2)
+        _btn(emk_top, "Экспорт таблицы…", self.export_emk_mismatches, side=tk.LEFT, padx=2)
+        self.emk_info = StringVar(value="Загрузите ЭМК и опержурнал, затем обновите сверку")
+        tk.Label(self.tab_emk, textvariable=self.emk_info, anchor="w").pack(fill=tk.X, padx=2)
+        emk_cols = ("Дата", "КВС", "Категория", "Код", "Шаблон", "ЭМК", "Диагноз", "Услуга")
+        emk_body = tk.Frame(self.tab_emk)
+        emk_body.pack(fill=tk.BOTH, expand=True)
+        self.tree_emk = ttk.Treeview(emk_body, columns=emk_cols, show="headings")
+        for c, w in zip(emk_cols, (90, 90, 160, 100, 90, 90, 200, 220)):
+            self.tree_emk.heading(c, text=c)
+            self.tree_emk.column(c, width=w, anchor="w")
+        emk_vs = ttk.Scrollbar(emk_body, orient=tk.VERTICAL, command=self.tree_emk.yview)
+        self.tree_emk.configure(yscrollcommand=emk_vs.set)
+        self.tree_emk.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        emk_vs.pack(side=tk.RIGHT, fill=tk.Y)
+
         uncl_top = tk.Frame(self.tab_uncl)
         uncl_top.pack(fill=tk.X, pady=2)
         _btn(uncl_top, "Экспорт списка…", self.export_unclassified, side=tk.LEFT, padx=2)
+        _btn(uncl_top, "Экспорт проблемных кодов…", self.export_problem_codes, side=tk.LEFT, padx=2)
         uncl_cols = ("Дата", "КВС", "Код", "Название КСГ", "КСГ", "Услуга")
         uncl_body = tk.Frame(self.tab_uncl)
         uncl_body.pack(fill=tk.BOTH, expand=True)
@@ -527,12 +570,81 @@ class DesktopApp:
             self.log_message(f"Год {year}: сводная {suggested}")
         else:
             self.log_message(
-                f"Год {year}: файла {suggested.name} нет в {suggested.parent}. "
-                "Укажите путь через «Обзор…» или «Сводная на год…».",
+                f"Год {year}: файла {suggested.name} нет в {suggested.parent}.",
                 level="WARNING",
             )
+            if messagebox.askyesno(
+                "Нет файла сводной",
+                f"Файла за {year} нет:\n{suggested}\n\n"
+                "Создать сводную на этот год из текущего шаблона?",
+            ):
+                self.create_year_summary_dialog()
+                return
         if not self.store.ops.empty:
             self.run_analysis()
+
+    def _summary_file_year(self) -> int | None:
+        path = self.summary_path.get().strip()
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=False)
+            try:
+                names = self.summary_cfg.get("sheet_names") or {}
+                for m in range(1, 13):
+                    sheet = names.get(m) or names.get(str(m))
+                    if not sheet or sheet not in wb.sheetnames:
+                        continue
+                    d = _as_date(wb[sheet]["C2"].value)
+                    if d and d.year >= 2000:
+                        return int(d.year)
+            finally:
+                wb.close()
+        except Exception:
+            return None
+        return None
+
+    def _maybe_hint_year_mismatch(self, ops: pd.DataFrame | None = None):
+        """Подсказка: данные/файл сводной и год в настройках не совпадают."""
+        if ops is None:
+            ops = self.store.ops
+        if ops is None or getattr(ops, "empty", True):
+            return
+        try:
+            cfg_year = int(self.year_var.get())
+        except ValueError:
+            return
+        op_years = sorted(
+            {int(y) for y in pd.to_datetime(ops["Дата"], errors="coerce").dt.year.dropna().unique()}
+        )
+        if not op_years:
+            return
+        data_year = int(max(op_years))
+        file_year = self._summary_file_year()
+        key = (tuple(op_years), cfg_year, file_year)
+        if key == self._year_hint_key:
+            return
+        problems = []
+        if data_year != cfg_year:
+            problems.append(f"в журнале год {data_year}, в настройках — {cfg_year}")
+        if file_year is not None and file_year != data_year:
+            problems.append(f"файл сводной на {file_year}, данные — {data_year}")
+        if not problems:
+            return
+        self._year_hint_key = key
+        msg = "Несовпадение года:\n• " + "\n• ".join(problems)
+        msg += f"\n\nСоздать/переключить сводную на {data_year}?"
+        if messagebox.askyesno("Подсказка: год", msg):
+            self.year_var.set(str(data_year))
+            self.summary_cfg["year"] = data_year
+            suggested = suggest_summary_path(self._summary_dir(), data_year)
+            if suggested.exists():
+                self.summary_path.set(str(suggested))
+                self._persist_settings()
+                self.log_message(f"Переключено на сводную {suggested}")
+                self.run_analysis()
+            else:
+                self.create_year_summary_dialog()
 
     def _tree_to_tsv(self, tree) -> str:
         cols = list(tree["columns"] or ())
@@ -711,9 +823,16 @@ class DesktopApp:
             self.store.clear()
             self.cat_table = self.totals_df = None
             self.weeks = []
+            self.loaded_department = None
+            self.last_emk_compare = None
             self._refresh_sources_list()
             self._set_kpis_empty()
             self._clear_trees()
+            if hasattr(self, "tab_emk"):
+                self.notebook.tab(self.tab_emk, text="Расхождения ЭМК")
+                self.emk_info.set("Загрузите ЭМК и опержурнал, затем обновите сверку")
+            if hasattr(self, "tab_uncl"):
+                self.notebook.tab(self.tab_uncl, text="Не классифицировано")
             self.log_message("Накопитель очищен")
             self.status_var.set("Очищено")
 
@@ -722,7 +841,8 @@ class DesktopApp:
             getattr(self, "tree_preview_cat", None),
             getattr(self, "tree_preview_tot", None),
             getattr(self, "tree_form", None),
-            self.tree_uncl,
+            getattr(self, "tree_emk", None),
+            getattr(self, "tree_uncl", None),
         ):
             if tree is None:
                 continue
@@ -730,9 +850,15 @@ class DesktopApp:
                 tree.delete(item)
 
     def load_emk(self):
-        path = filedialog.askopenfilename(filetypes=[("Excel/CSV", "*.xlsx *.csv")])
+        path = filedialog.askopenfilename(
+            initialdir=self.last_emk_dir,
+            filetypes=[("Excel/CSV", "*.xlsx *.csv")],
+            title="ЭМК",
+        )
         if not path:
             return
+        self.last_emk_dir = str(Path(path).parent)
+        self._persist_settings()
         try:
             self._busy(True)
             self.df_emk = read_table(path)
@@ -792,22 +918,69 @@ class DesktopApp:
         return updated
 
     def load_surg(self):
-        paths = filedialog.askopenfilenames(filetypes=[("Excel/CSV", "*.xlsx *.csv")])
+        paths = filedialog.askopenfilenames(
+            initialdir=self.last_surg_dir,
+            filetypes=[("Excel/CSV", "*.xlsx *.csv")],
+            title="Опержурнал(ы)",
+        )
         if not paths:
             return
+        self.last_surg_dir = str(Path(paths[0]).parent)
+        self._persist_settings()
+        self._ingest_surg_paths(list(paths))
+
+    def load_surg_folder(self):
+        folder = filedialog.askdirectory(
+            initialdir=self.last_surg_dir,
+            title="Папка с опержурналами",
+        )
+        if not folder:
+            return
+        self.last_surg_dir = folder
+        self._persist_settings()
+        base = Path(folder)
+        paths = sorted(
+            [*(base.glob("*.xlsx")), *(base.glob("*.xls")), *(base.glob("*.csv"))],
+            key=lambda p: p.name.lower(),
+        )
+        paths = [p for p in paths if not p.name.startswith("~$") and ".bak." not in p.name.lower()]
+        if not paths:
+            messagebox.showinfo("Папка", "В папке нет Excel/CSV журналов")
+            return
+        if not messagebox.askyesno(
+            "Загрузка из папки",
+            f"Найдено файлов: {len(paths)}\n\nЗагрузить все?",
+        ):
+            return
+        self._ingest_surg_paths([str(p) for p in paths])
+
+    def _ingest_surg_paths(self, paths: list):
         try:
             self._busy(True)
+            dept = self.dept_var.get()
+            any_added = False
             for path in paths:
                 try:
                     df = read_table(path)
+                    n_all = len(df)
                     analyzer = SurgeryAnalyzer(
-                        df, self.dept_var.get(), self.config["surgery_categories"], emk_df=self.df_emk
+                        df, dept, self.config["surgery_categories"], emk_df=self.df_emk
                     )
+                    n_dept = len(analyzer.df)
+                    self.log_message(
+                        f"{os.path.basename(path)}: фильтр «{dept}» — {n_dept} из {n_all} строк журнала"
+                    )
+                    if n_dept == 0:
+                        self.log_message(
+                            f"  нет строк отделения — проверьте название в журнале (колонки "
+                            f"«Отделение госпитализации» / «Оперблок»)"
+                        )
                     ops = analyzer.extract_operations()
                     if ops.empty:
                         self.log_message(f"Нет операций: {os.path.basename(path)}")
                         continue
                     info = self.store.add(ops, path)
+                    any_added = True
                     self.last_batch_span = (info.get("date_from"), info.get("date_to"))
                     msg = f"{os.path.basename(path)}: +{info['added']}, вытеснено {info['removed']}, всего {info['total']}"
                     if info.get("date_from") is not None:
@@ -830,9 +1003,12 @@ class DesktopApp:
                 except Exception as e:
                     messagebox.showerror("Ошибка", f"{os.path.basename(path)}:\n{e}")
                     logging.error(traceback.format_exc())
+            if any_added:
+                self.loaded_department = dept
             self._refresh_sources_list()
             self.run_analysis()
             self.notebook.select(self.tab_preview)
+            self._maybe_hint_year_mismatch()
         finally:
             self._busy(False)
 
@@ -948,8 +1124,8 @@ class DesktopApp:
             self.kpi_diff_var.set("нет связи")
             return
         result = compare_plan_emergency(ops, self.summary_cfg)
-        self.last_emk_compare = result
         self.kpi_diff_var.set(str(len(result["mismatches"])))
+        self._fill_emk_tree(result, select_tab=False)
 
     def on_emk_mode(self):
         if self.df_emk is None:
@@ -958,6 +1134,40 @@ class DesktopApp:
             return
         self.run_analysis()
         self.show_emk_diff()
+
+    def _fill_emk_tree(self, result: dict, *, select_tab: bool = False):
+        self.last_emk_compare = result
+        mismatches = result.get("mismatches") or []
+        n = len(mismatches)
+        compared = int(result.get("compared") or 0)
+        if hasattr(self, "tree_emk"):
+            for item in self.tree_emk.get_children():
+                self.tree_emk.delete(item)
+            for m in mismatches:
+                dt = m.get("Дата")
+                dt_s = dt.strftime("%d.%m.%Y") if hasattr(dt, "strftime") else str(dt or "")
+                self.tree_emk.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        dt_s,
+                        m.get("КВС"),
+                        m.get("Категория"),
+                        m.get("Код"),
+                        m.get("Шаблон"),
+                        m.get("ЭМК"),
+                        str(m.get("Диагноз") or "")[:100],
+                        str(m.get("Услуга") or "")[:100],
+                    ),
+                )
+            self.notebook.tab(self.tab_emk, text=f"Расхождения ЭМК ({n})")
+            if n:
+                self.emk_info.set(f"Расхождений: {n} из {compared} сравнений")
+            else:
+                self.emk_info.set(f"Расхождений нет (сравнено {compared})")
+        self.kpi_diff_var.set(str(n))
+        if select_tab and hasattr(self, "tab_emk"):
+            self.notebook.select(self.tab_emk)
 
     def show_emk_diff(self):
         ops = self.get_view_ops()
@@ -971,11 +1181,13 @@ class DesktopApp:
             messagebox.showwarning("Нет связи", "КВС журнала и ЭМК не пересекаются")
             return
         result = compare_plan_emergency(ops, self.summary_cfg)
-        self.kpi_diff_var.set(str(len(result["mismatches"])))
-        self.notebook.select(self.tab_log)
+        self._fill_emk_tree(result, select_tab=True)
         self.log_message(format_mismatch_report(result))
         if result["mismatches"]:
-            messagebox.showwarning("Расхождения", f"Найдено: {len(result['mismatches'])}\nСм. вкладку Журнал")
+            messagebox.showwarning(
+                "Расхождения",
+                f"Найдено: {len(result['mismatches'])}\nСм. вкладку «Расхождения ЭМК»",
+            )
         else:
             messagebox.showinfo("Сверка", "Расхождений нет")
 
@@ -1185,6 +1397,16 @@ class DesktopApp:
             messagebox.showerror("Нет файла", f"Сводная не найдена:\n{path}")
             return
 
+        selected = self.dept_var.get()
+        if self.loaded_department and self.loaded_department != selected:
+            if not messagebox.askyesno(
+                "Отделение",
+                f"В накопителе данные для «{self.loaded_department}»,\n"
+                f"а выбрано «{selected}».\n\n"
+                "Записать всё равно?",
+            ):
+                return
+
         d_min, d_max = self.last_batch_span
         if d_min is None or d_max is None:
             d_min, d_max = self.store.date_span(self.store.ops)
@@ -1302,17 +1524,86 @@ class DesktopApp:
                     self.log_message(f"  [{sheet}] форма 4001: {form}")
             self.status_var.set(f"Запись: {report.get('cells_written', 0)} ячеек")
             self._persist_settings()
-            if messagebox.askyesno(
-                "Готово",
-                f"Обновлено: {months}\nЯчеек: {report.get('cells_written', 0)}\n\n"
-                "Открыть файл? (если Excel был открыт — закройте и откройте заново)",
-            ):
+            verify_msg = ""
+            if write_weeks:
+                try:
+                    vres = verify_write_report(path, report)
+                    verify_msg = format_verify_message(vres)
+                    self.log_message(verify_msg, level="INFO" if vres.get("ok") else "WARNING")
+                except Exception as ve:
+                    verify_msg = f"Проверка записи не выполнена: {ve}"
+                    self.log_message(verify_msg, level="WARNING")
+            bak = report.get("backup")
+            done = (
+                f"Обновлено: {months}\nЯчеек: {report.get('cells_written', 0)}\n"
+            )
+            if bak:
+                done += f"Бэкап: {Path(bak).name}\n"
+            if verify_msg:
+                done += f"\n{verify_msg}\n"
+            done += "\nОткрыть файл? (если Excel был открыт — закройте и откройте заново)"
+            if messagebox.askyesno("Готово", done):
                 self.open_summary_file()
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
             self.log_message(traceback.format_exc(), level="ERROR")
         finally:
             self._busy(False)
+
+    def restore_summary_backup(self):
+        path = self.summary_path.get().strip()
+        if not path:
+            messagebox.showerror("Сводная", "Сначала укажите файл сводной")
+            return
+        baks = list_backups(path)
+        if not baks:
+            messagebox.showinfo(
+                "Бэкапы",
+                f"Рядом с файлом нет бэкапов (.bak.xlsx):\n{Path(path).parent}",
+            )
+            return
+        top = tk.Toplevel(self.root)
+        top.title("Восстановить из бэкапа")
+        top.transient(self.root)
+        tk.Label(
+            top,
+            text="Выберите бэкап (хранятся последние 10). Текущий файл сохранится перед восстановлением.",
+            wraplength=520,
+            justify=tk.LEFT,
+        ).pack(padx=12, pady=8, anchor="w")
+        lb = tk.Listbox(top, width=72, height=min(12, max(4, len(baks))))
+        lb.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+        for b in baks:
+            mtime = datetime.fromtimestamp(b.stat().st_mtime).strftime("%d.%m.%Y %H:%M")
+            lb.insert(tk.END, f"{mtime}  —  {b.name}")
+        lb.selection_set(0)
+
+        def do_restore():
+            sel = lb.curselection()
+            if not sel:
+                return
+            bak = baks[int(sel[0])]
+            if excel_file_locked(path):
+                messagebox.showerror("Файл занят", "Закройте сводную в Excel", parent=top)
+                return
+            if not messagebox.askyesno(
+                "Восстановление",
+                f"Заменить текущую сводную содержимым:\n{bak.name}?",
+                parent=top,
+            ):
+                return
+            try:
+                restore_backup(bak, path)
+                self.log_message(f"Восстановлено из бэкапа: {bak}")
+                messagebox.showinfo("Готово", f"Восстановлено:\n{path}", parent=top)
+                top.destroy()
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e), parent=top)
+
+        bf = tk.Frame(top)
+        bf.pack(pady=10)
+        _btn(bf, "Восстановить", do_restore, side=tk.LEFT, padx=4)
+        _btn(bf, "Отмена", top.destroy, side=tk.LEFT, padx=4)
 
     def open_summary_file(self):
         path = self.summary_path.get().strip()
@@ -1481,7 +1772,7 @@ class DesktopApp:
             "Обновления: Помощь → Проверить обновления…",
         )
 
-    def check_updates(self, silent: bool = False):
+    def check_updates(self, silent: bool = False, force: bool = False):
         """Проверить GitHub и предложить установить обновление."""
         cfg = self.config.get("updates") or {}
         if not cfg.get("enabled", True):
@@ -1500,6 +1791,8 @@ class DesktopApp:
         finally:
             self._busy(False)
             self.status_var.set("Готов к работе")
+
+        self._mark_update_checked()
 
         if info is None:
             ver = read_local_version(APP_DIR)
@@ -1591,6 +1884,68 @@ class DesktopApp:
 
             _btn(bf, "Открыть на GitHub", open_page, side=tk.LEFT, padx=4)
 
+    def _mark_update_checked(self):
+        self.last_update_check = datetime.now().strftime("%Y-%m-%d")
+        try:
+            self._persist_settings()
+        except Exception:
+            pass
+
+    def _maybe_startup_update_check(self):
+        cfg = self.config.get("updates") or {}
+        if not cfg.get("enabled", True) or not cfg.get("check_on_startup", True):
+            return
+        try:
+            days = int(cfg.get("check_interval_days", 7) or 7)
+        except (TypeError, ValueError):
+            days = 7
+        days = max(1, days)
+        last = (self.last_update_check or "").strip()
+        if last:
+            try:
+                last_d = datetime.strptime(last[:10], "%Y-%m-%d").date()
+                if (datetime.now().date() - last_d).days < days:
+                    self.log_message(
+                        f"Обновления: автопроверка пропущена (последняя {last_d.isoformat()}, интервал {days} дн.)"
+                    )
+                    return
+            except ValueError:
+                pass
+        self.check_updates(silent=True)
+
+    def _dept_profile(self, name: str | None = None) -> dict:
+        profiles = self.config.get("department_profiles") or {}
+        return dict(profiles.get(name or self.dept_var.get()) or {})
+
+    def _refresh_dept_hint(self):
+        if not hasattr(self, "dept_hint_var"):
+            return
+        prof = self._dept_profile()
+        rub = str(prof.get("rubricator") or "lor")
+        if rub == "lor":
+            self.dept_hint_var.set("Рубрикатор: ЛОР")
+        else:
+            self.dept_hint_var.set("Фильтр журнала — да; рубрикатор пока общий (ЛОР)")
+
+    def _on_department_changed(self):
+        old = self._prev_dept
+        new = self.dept_var.get()
+        if old and old != new:
+            self.summary_paths_by_dept[old] = self.summary_path.get()
+            saved = self.summary_paths_by_dept.get(new)
+            if saved:
+                self.summary_path.set(saved)
+            if not self.store.ops.empty and self.loaded_department and self.loaded_department != new:
+                messagebox.showwarning(
+                    "Отделение",
+                    f"В накопителе данные для «{self.loaded_department}».\n"
+                    f"Выбрано «{new}».\n\n"
+                    "Очистите накопитель и загрузите журналы заново.",
+                )
+        self._prev_dept = new
+        self._refresh_dept_hint()
+        self._persist_settings()
+
     def _restart_app(self):
         try:
             self._persist_settings()
@@ -1641,8 +1996,20 @@ class DesktopApp:
             self.write_form_var.set(bool(s["write_form"]))
         if s.get("plan_mode") in ("template", "emk"):
             self.plan_mode.set(s["plan_mode"])
+        if s.get("last_surg_dir"):
+            self.last_surg_dir = str(s["last_surg_dir"])
+        if s.get("last_emk_dir"):
+            self.last_emk_dir = str(s["last_emk_dir"])
+        if s.get("last_update_check"):
+            self.last_update_check = str(s["last_update_check"])
+        if isinstance(s.get("summary_paths_by_dept"), dict):
+            self.summary_paths_by_dept = {
+                str(k): str(v) for k, v in s["summary_paths_by_dept"].items() if v
+            }
 
     def _persist_settings(self):
+        # актуальный путь для текущего отделения
+        self.summary_paths_by_dept[self.dept_var.get()] = self.summary_path.get()
         save_settings(
             APP_DIR,
             {
@@ -1656,6 +2023,10 @@ class DesktopApp:
                 "write_weeks": bool(self.write_weeks_var.get()),
                 "write_form": bool(self.write_form_var.get()),
                 "plan_mode": self.plan_mode.get(),
+                "last_surg_dir": self.last_surg_dir,
+                "last_emk_dir": self.last_emk_dir,
+                "last_update_check": self.last_update_check,
+                "summary_paths_by_dept": self.summary_paths_by_dept,
             },
         )
 
@@ -1712,6 +2083,88 @@ class DesktopApp:
             else:
                 out.to_csv(path, index=False, encoding="utf-8-sig")
             self.log_message(f"Экспорт неклассифицированных: {path} ({len(out)} строк)")
+            messagebox.showinfo("Готово", f"Сохранено {len(out)} строк:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+
+    def export_problem_codes(self):
+        ops = self.get_view_ops()
+        if ops.empty:
+            messagebox.showwarning("Нет данных", "Нет операций")
+            return
+        table = build_problem_codes_table(ops)
+        if table.empty:
+            messagebox.showinfo("Экспорт", "Неклассифицированных кодов нет")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile="проблемные_коды.xlsx",
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")],
+        )
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".xlsx"):
+                table.to_excel(path, index=False)
+            else:
+                table.to_csv(path, index=False, encoding="utf-8-sig")
+            draft_path = str(Path(path).with_suffix(".yaml"))
+            Path(draft_path).write_text(format_config_draft(table), encoding="utf-8")
+            self.log_message(
+                f"Экспорт проблемных кодов: {path} ({len(table)} кодов), черновик: {draft_path}"
+            )
+            messagebox.showinfo(
+                "Готово",
+                f"Таблица: {path}\n"
+                f"Кодов: {len(table)}\n\n"
+                f"Черновик для config.yaml:\n{draft_path}",
+            )
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+
+    def export_emk_mismatches(self):
+        result = self.last_emk_compare
+        if not result or not result.get("mismatches"):
+            ops = self.get_view_ops()
+            if ops.empty or self.df_emk is None:
+                messagebox.showinfo("Экспорт", "Сначала выполните сверку ЭМК")
+                return
+            result = compare_plan_emergency(ops, self.summary_cfg)
+            self._fill_emk_tree(result, select_tab=False)
+        mismatches = result.get("mismatches") or []
+        if not mismatches:
+            messagebox.showinfo("Экспорт", "Расхождений нет")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile="расхождения_эмк.xlsx",
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")],
+        )
+        if not path:
+            return
+        rows = []
+        for m in mismatches:
+            dt = m.get("Дата")
+            dt_s = dt.strftime("%d.%m.%Y") if hasattr(dt, "strftime") else str(dt or "")
+            rows.append(
+                {
+                    "Дата": dt_s,
+                    "КВС": m.get("КВС"),
+                    "Категория": m.get("Категория"),
+                    "Код": m.get("Код"),
+                    "Шаблон": m.get("Шаблон"),
+                    "ЭМК": m.get("ЭМК"),
+                    "Диагноз": m.get("Диагноз"),
+                    "Услуга": m.get("Услуга"),
+                }
+            )
+        out = pd.DataFrame(rows)
+        try:
+            if path.lower().endswith(".xlsx"):
+                out.to_excel(path, index=False)
+            else:
+                out.to_csv(path, index=False, encoding="utf-8-sig")
+            self.log_message(f"Экспорт расхождений ЭМК: {path} ({len(out)} строк)")
             messagebox.showinfo("Готово", f"Сохранено {len(out)} строк:\n{path}")
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
