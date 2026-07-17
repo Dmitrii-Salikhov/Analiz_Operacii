@@ -57,7 +57,6 @@ APP_DIR = (
 os.chdir(APP_DIR)
 APP_LOG = AppLog(APP_DIR / "analysis.log", max_lines=500)
 
-# Дублируем в стандартный logging (без отдельного file handler — пишет AppLog)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
@@ -275,6 +274,7 @@ class DesktopApp:
         tk.Label(r3, text="Файл сводной:").pack(side=tk.LEFT)
         tk.Entry(r3, textvariable=self.summary_path).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         _btn(r3, "Обзор…", self.choose_summary, side=tk.LEFT)
+        _btn(r3, "Сводная на год…", self.create_year_summary_dialog, side=tk.LEFT, padx=(4, 0))
 
         # --- тело: источники + вкладки ---
         body = tk.Frame(self.root)
@@ -506,19 +506,29 @@ class DesktopApp:
         top.focus_force()
         top.lift()
 
+    def _summary_dir(self) -> Path:
+        """Папка текущей сводной (любая; не обязана быть рядом с программой)."""
+        p = Path(self.summary_path.get().strip() or "")
+        if p.is_file() or p.suffix.lower() in {".xlsx", ".xlsm"}:
+            return p.parent if str(p.parent) not in ("", ".") else APP_DIR
+        if p.is_dir():
+            return p
+        return APP_DIR
+
     def _on_year_changed(self):
         try:
             year = int(self.year_var.get())
         except ValueError:
             return
         self.summary_cfg["year"] = year
-        suggested = suggest_summary_path(APP_DIR, year)
+        suggested = suggest_summary_path(self._summary_dir(), year)
         if suggested.exists():
             self.summary_path.set(str(suggested))
-            self.log_message(f"Год {year}: сводная {suggested.name}")
+            self.log_message(f"Год {year}: сводная {suggested}")
         else:
             self.log_message(
-                f"Год {year}: файла {suggested.name} нет — создайте через «Создать сводную на год…»",
+                f"Год {year}: файла {suggested.name} нет в {suggested.parent}. "
+                "Укажите путь через «Обзор…» или «Сводная на год…».",
                 level="WARNING",
             )
         if not self.store.ops.empty:
@@ -685,9 +695,15 @@ class DesktopApp:
         return compute_month_weeks(year, month)
 
     def choose_summary(self):
-        path = filedialog.askopenfilename(initialdir=str(APP_DIR), filetypes=[("Excel", "*.xlsx")])
+        initial = self._summary_dir()
+        path = filedialog.askopenfilename(
+            initialdir=str(initial),
+            filetypes=[("Excel", "*.xlsx")],
+            title="Выберите файл сводной",
+        )
         if path:
             self.summary_path.set(path)
+            self._persist_settings()
             self.log_message(f"Сводная: {path}")
 
     def clear_store(self):
@@ -1368,30 +1384,55 @@ class DesktopApp:
         """Создать файл «Операции сводная YYYY.xlsx» на новый год из текущего шаблона."""
         tpl = self.summary_path.get().strip()
         if not tpl or not os.path.exists(tpl):
-            messagebox.showerror("Нет шаблона", "Укажите существующую сводную как основу")
+            messagebox.showerror(
+                "Нет шаблона",
+                "Укажите существующую сводную через «Обзор…» — файл может лежать в любой папке.",
+            )
             return
         try:
             cur = int(self.year_var.get())
         except ValueError:
             cur = 2026
         new_year = cur + 1
-        # простой диалог
+        base_dir = self._summary_dir()
+
         top = tk.Toplevel(self.root)
         top.title("Сводная на год")
         top.transient(self.root)
-        tk.Label(top, text="Создать файл сводной на год:").pack(padx=12, pady=8)
+        tk.Label(
+            top,
+            text="Новый файл будет создан в той же папке, что и текущая сводная.",
+            wraplength=480,
+            justify=tk.LEFT,
+        ).pack(padx=12, pady=(12, 4), anchor="w")
+        tk.Label(top, text="Год:").pack(padx=12, anchor="w")
         yvar = StringVar(value=str(new_year))
-        ttk.Combobox(top, textvariable=yvar, values=[str(y) for y in range(cur, cur + 6)], width=8).pack()
-        out_hint = StringVar(value=str(suggest_summary_path(APP_DIR, new_year)))
+        ttk.Combobox(top, textvariable=yvar, values=[str(y) for y in range(cur, cur + 6)], width=8).pack(
+            padx=12, anchor="w"
+        )
+        out_hint = StringVar(value=str(suggest_summary_path(base_dir, new_year)))
 
         def refresh_hint(*_a):
             try:
-                out_hint.set(str(suggest_summary_path(APP_DIR, int(yvar.get()))))
+                out_hint.set(str(suggest_summary_path(base_dir, int(yvar.get()))))
             except ValueError:
                 pass
 
         yvar.trace_add("write", refresh_hint)
-        tk.Label(top, textvariable=out_hint, wraplength=420, justify=tk.LEFT).pack(padx=12, pady=4)
+        tk.Label(top, text="Путь:", anchor="w").pack(padx=12, pady=(8, 0), anchor="w")
+        tk.Label(top, textvariable=out_hint, wraplength=480, justify=tk.LEFT, fg="#333").pack(
+            padx=12, pady=4, anchor="w"
+        )
+
+        def pick_other_folder():
+            folder = filedialog.askdirectory(initialdir=str(base_dir), parent=top, title="Папка для новой сводной")
+            if not folder:
+                return
+            try:
+                y = int(yvar.get())
+            except ValueError:
+                y = new_year
+            out_hint.set(str(suggest_summary_path(Path(folder), y)))
 
         def do_create():
             try:
@@ -1415,6 +1456,7 @@ class DesktopApp:
                 self.year_var.set(str(y))
                 self.summary_cfg["year"] = y
                 self.summary_path.set(str(path))
+                self._persist_settings()
                 self.log_message(f"Создана сводная на {y}: {path}")
                 messagebox.showinfo("Готово", f"Создан файл:\n{path}", parent=top)
                 top.destroy()
@@ -1423,6 +1465,7 @@ class DesktopApp:
 
         bf = tk.Frame(top)
         bf.pack(pady=10)
+        _btn(bf, "Другая папка…", pick_other_folder, side=tk.LEFT, padx=4)
         _btn(bf, "Создать", do_create, side=tk.LEFT, padx=4)
         _btn(bf, "Отмена", top.destroy, side=tk.LEFT, padx=4)
 

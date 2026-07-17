@@ -2,15 +2,33 @@
 """Создание сводной на новый год из шаблона предыдущего."""
 from __future__ import annotations
 
-import calendar
 import shutil
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Dict, Optional
 
 import openpyxl
 
 from analyzers.summary_writer import MONTH_RU
+
+# Excel epoch (совместимо с openpyxl / Windows Excel)
+_EXCEL_EPOCH = date(1899, 12, 30)
+
+
+def _set_sheet_month_start(ws, year: int, month: int) -> None:
+    """C2 = 1-е число месяца как дата Excel без времени (иначе #### в узком столбце)."""
+    cell = ws.cell(2, 3)
+    d = date(year, month, 1)
+    # целое serial — без datetime/00:00:00; формат как у соседних дат шапки (слэш, не точка/запятая)
+    cell.value = (d - _EXCEL_EPOCH).days
+    cell.number_format = "DD/MM/YYYY"
+
+
+def _clear_if_not_formula(cell) -> None:
+    v = cell.value
+    if isinstance(v, str) and v.startswith("="):
+        return
+    cell.value = None
 
 
 def create_year_summary(
@@ -23,8 +41,8 @@ def create_year_summary(
     """
     Копирует шаблон сводной и готовит файл на new_year:
     - C2 каждого месячного листа = 1-е число месяца new_year (даты недель пересчитает Excel);
-    - при clear_values очищает числовые ячейки категорий C–G (формулы H/ИТОГ/форма не трогаем жёстко —
-      очищаем только строки категорий и детей/человек).
+    - при clear_values очищает числовые ячейки категорий C–G и ручные ячейки формы 4001
+      (в т.ч. колонку S «Всего (из гр.3 т.4000)»); формулы не трогает.
     """
     src = Path(template_path)
     if not src.exists():
@@ -52,44 +70,31 @@ def create_year_summary(
         if sheet not in wb.sheetnames:
             continue
         ws = wb[sheet]
-        # дата начала месяца — Excel serial через datetime
-        ws.cell(2, 3).value = datetime(new_year, month, 1)
-        # заголовок
+        _set_sheet_month_start(ws, new_year, month)
+
         title = ws.cell(1, 1).value
         if isinstance(title, str):
             for y in range(new_year - 5, new_year + 2):
                 title = title.replace(str(y), str(new_year))
-            # «за апрель 2026» → новый год
-            for mname in MONTH_RU.values():
-                if mname in title.lower():
-                    pass
             ws.cell(1, 1).value = title
 
         if clear_values:
+            # категории / дети / человек — C–G
             for row in range(4, 38):
                 for col in range(3, 8):
-                    cell = ws.cell(row, col)
-                    # не затираем формулы
-                    if isinstance(cell.value, str) and str(cell.value).startswith("="):
-                        continue
-                    cell.value = None
+                    _clear_if_not_formula(ws.cell(row, col))
             for row in (43, 45):
                 for col in range(3, 8):
-                    cell = ws.cell(row, col)
-                    if isinstance(cell.value, str) and str(cell.value).startswith("="):
-                        continue
-                    cell.value = None
-            # листовые числа формы 4001 (N/O/P/Q/R строк 12–17)
-            for row in range(12, 18):
-                for col in range(14, 19):
-                    cell = ws.cell(row, col)
-                    if isinstance(cell.value, str) and str(cell.value).startswith("="):
-                        continue
-                    cell.value = None
+                    _clear_if_not_formula(ws.cell(row, col))
+            # форма 4001: N–S (14–19), строки 11–17
+            # в т.ч. S «Всего (из гр.3 т.4000)»; формулы итогов не трогаем
+            for row in range(11, 18):
+                for col in range(14, 20):
+                    _clear_if_not_formula(ws.cell(row, col))
 
     wb.save(out)
     return out
 
 
 def suggest_summary_path(app_dir: Path, year: int) -> Path:
-    return app_dir / f"Операции сводная {year}.xlsx"
+    return Path(app_dir) / f"Операции сводная {year}.xlsx"

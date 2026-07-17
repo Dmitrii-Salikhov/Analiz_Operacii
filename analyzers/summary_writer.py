@@ -217,8 +217,12 @@ class SummaryWriter:
                 data_year = int(pd.to_datetime(month_ops["Дата"]).dt.year.mode().iloc[0])
                 if weeks[0][0].year != data_year:
                     weeks = compute_month_weeks(data_year, int(month))
-                    # и синхронизируем C2, чтобы Excel пересчитал шапку
-                    ws.cell(2, 3).value = datetime(data_year, int(month), 1)
+                    # и синхронизируем C2, чтобы Excel пересчитал шапку (дата без времени)
+                    c2 = ws.cell(2, 3)
+                    c2.value = (
+                        date(data_year, int(month), 1) - date(1899, 12, 30)
+                    ).days
+                    c2.number_format = "DD/MM/YYYY"
 
             cols_touched = set()
             if write_weeks:
