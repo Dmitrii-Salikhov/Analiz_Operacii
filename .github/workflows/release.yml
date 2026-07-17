@@ -1,0 +1,71 @@
+# Релиз по тегу v*: тесты → сборка Windows-папки → ZIP + SHA256 → GitHub Release
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Тесты
+        run: pytest tests/ -q --tb=short
+
+  build-and-release:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Сборка onedir
+        shell: pwsh
+        run: ./build_windows.ps1
+
+      - name: ZIP + SHA-256
+        shell: pwsh
+        run: |
+          $dist = "dist\AnalizOperacii"
+          if (-not (Test-Path $dist)) { throw "нет папки $dist" }
+          $zip = "dist\AnalizOperacii-Windows.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$dist\*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  AnalizOperacii-Windows.zip" | Out-File -FilePath "dist\AnalizOperacii-Windows.zip.sha256" -Encoding ascii
+          Write-Host "SHA256: $hash"
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/AnalizOperacii-Windows.zip
+            dist/AnalizOperacii-Windows.zip.sha256
+          name: "Analiz Operacii ${{ github.ref_name }}"
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

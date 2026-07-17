@@ -1,0 +1,19 @@
+.venv/
+.venv_py39_bak/
+__pycache__/
+*.pyc
+.DS_Store
+analysis.log
+ui_settings.json
+.update_backup_*/
+*.xlsx.bak
+.~*
+build/
+dist/
+*.spec
+.pytest_cache/
+
+# локальные журналы/ЭМК (персональные данные — не в git)
+Отчет*.xlsx
+Отчёт*.xlsx
+Untitled.xlsx
