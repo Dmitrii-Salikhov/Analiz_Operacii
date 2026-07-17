@@ -71,7 +71,8 @@ def _btn(parent, text, command, **pack):
 class DesktopApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Сводная операций — Видновская КБ")
+        self.app_version = read_local_version(APP_DIR)
+        self.root.title(f"Сводная операций  v{self.app_version}")
         self.root.geometry("1200x780")
         self.root.minsize(900, 600)
 
@@ -191,7 +192,13 @@ class DesktopApp:
         top = tk.Frame(self.root)
         top.pack(fill=tk.X, padx=8, pady=2)
         tk.Label(top, text="Сводная операционной деятельности", font=("Helvetica", 14, "bold")).pack(side=tk.LEFT)
-        tk.Label(top, text="  Отделение:").pack(side=tk.LEFT)
+        tk.Label(
+            top,
+            text=f"  v{getattr(self, 'app_version', read_local_version(APP_DIR))}",
+            font=("Helvetica", 12),
+            fg="#555",
+        ).pack(side=tk.LEFT, padx=(4, 12))
+        tk.Label(top, text="Отделение:").pack(side=tk.LEFT)
         dept_list = self.config["departments"]["list"]
         self.dept_combo = ttk.Combobox(top, textvariable=self.dept_var, values=dept_list, width=40, state="readonly")
         self.dept_combo.pack(side=tk.LEFT, padx=4)
@@ -1426,7 +1433,7 @@ class DesktopApp:
         repo_line = f"\nGitHub: {repo}" if repo != "/" and repo else ""
         messagebox.showinfo(
             "О программе",
-            f"Сводная операций v{ver}\nВидновская КБ{repo_line}\n\n"
+            f"Сводная операций\nВерсия: {ver}{repo_line}\n\n"
             "Запись: один диалог с галочками «Недели» и «Форма 4001».\n"
             "Обновления: Помощь → Проверить обновления…",
         )
