@@ -37,6 +37,8 @@ def create_year_summary(
     output_path: Optional[str] = None,
     sheet_names: Optional[Dict[int, str]] = None,
     clear_values: bool = True,
+    category_row_max: Optional[int] = None,
+    totals_rows: Optional[Dict[str, int]] = None,
 ) -> Path:
     """
     Копирует шаблон сводной и готовит файл на new_year:
@@ -65,6 +67,11 @@ def create_year_summary(
         12: "Декабрь",
     }
 
+    cat_hi = int(category_row_max) if category_row_max else 37
+    cat_hi = max(4, cat_hi)
+    tot = totals_rows or {"children": 43, "patients": 45}
+    tot_rows = sorted({int(v) for v in tot.values()})
+
     wb = openpyxl.load_workbook(out)
     for month, sheet in names.items():
         if sheet not in wb.sheetnames:
@@ -79,11 +86,11 @@ def create_year_summary(
             ws.cell(1, 1).value = title
 
         if clear_values:
-            # категории / дети / человек — C–G
-            for row in range(4, 38):
+            # категории — C–G до фактического max(category_rows)
+            for row in range(4, cat_hi + 1):
                 for col in range(3, 8):
                     _clear_if_not_formula(ws.cell(row, col))
-            for row in (43, 45):
+            for row in tot_rows:
                 for col in range(3, 8):
                     _clear_if_not_formula(ws.cell(row, col))
             # форма 4001: N–S (14–19), строки 11–17

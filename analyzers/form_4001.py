@@ -119,6 +119,47 @@ ENDO_CATS = [
 FORM_LINE_LABELS = {r["line"]: r["name"] for r in FORM_ROWS if r["line"]}
 
 
+def resolve_line_total_cats(form_cfg: Optional[dict] = None) -> Dict[str, List[str]]:
+    """Списки категорий для N: из form_4001.line_categories или встроенные LINE_TOTAL_CATS."""
+    base = {k: list(v) for k, v in LINE_TOTAL_CATS.items()}
+    extra = (form_cfg or {}).get("line_categories") or {}
+    for line, cats in extra.items():
+        key = str(line)
+        merged = list(base.get(key, []))
+        for c in cats or []:
+            s = str(c)
+            if s not in merged:
+                merged.append(s)
+        base[key] = merged
+    return base
+
+
+def resolve_line_hist_cats(form_cfg: Optional[dict] = None) -> Dict[str, List[str]]:
+    base = {k: list(v) for k, v in LINE_HIST_CATS.items()}
+    extra = (form_cfg or {}).get("hist_categories") or {}
+    for line, cats in extra.items():
+        key = str(line)
+        merged = list(base.get(key, []))
+        for c in cats or []:
+            s = str(c)
+            if s not in merged:
+                merged.append(s)
+        base[key] = merged
+    return base
+
+
+def resolve_endo_cats(form_cfg: Optional[dict] = None) -> List[str]:
+    extra = (form_cfg or {}).get("endo_categories")
+    if extra is None:
+        return list(ENDO_CATS)
+    merged = list(ENDO_CATS)
+    for c in extra:
+        s = str(c)
+        if s not in merged:
+            merged.append(s)
+    return merged
+
+
 def _cat_counts(month_ops: pd.DataFrame) -> Dict[str, int]:
     if month_ops is None or month_ops.empty or "Категория" not in month_ops.columns:
         return {}
@@ -153,6 +194,7 @@ def compute_form_4001(
     categories: List[dict] = None,  # noqa: ARG001 — совместимость вызовов
     line_rows: Dict[str, int] = None,  # noqa: ARG001
     pension_age: int = 60,
+    form_cfg: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """
     Счётчики «как после пересчёта Excel»: N/R по формулам от категорий,
@@ -162,10 +204,14 @@ def compute_form_4001(
     counts = _cat_counts(ops)
     ages = pd.to_numeric(ops["Возраст"], errors="coerce") if not ops.empty else pd.Series(dtype=float)
 
+    line_totals = resolve_line_total_cats(form_cfg)
+    line_hist = resolve_line_hist_cats(form_cfg)
+    endo_cats = resolve_endo_cats(form_cfg)
+
     lines: Dict[str, dict] = {}
-    for line, cats in LINE_TOTAL_CATS.items():
+    for line, cats in line_totals.items():
         total = _sum_cats(counts, cats)
-        hist = _sum_cats(counts, LINE_HIST_CATS.get(line, []))
+        hist = _sum_cats(counts, line_hist.get(line, []))
         # 15–17 и до 1 года — по всем операциям группы строки
         m_u1 = _age_mask(ops, None, 0.999) if not ops.empty else None
         m_1517 = _age_mask(ops, 15, 17) if not ops.empty else None
@@ -205,7 +251,7 @@ def compute_form_4001(
     }
 
     pension = int((ages >= pension_age).sum()) if not ops.empty else 0
-    endo = _sum_cats(counts, ENDO_CATS)
+    endo = _sum_cats(counts, endo_cats)
 
     # Всего: N18 = N16+N14+N11; O18 = O11+O14+O16−Q14; …
     b6, b17 = lines["6"], lines["17"]
@@ -314,7 +360,9 @@ def write_form_4001(
     col_senior = int(cols.get("senior", 19))     # S
     pension_row = int(form_cfg.get("pension_row", 17))
 
-    stats = compute_form_4001(month_ops, categories, pension_age=pension_age)
+    stats = compute_form_4001(
+        month_ops, categories, pension_age=pension_age, form_cfg=form_cfg
+    )
     written = 0
     lines = stats["lines"]
 

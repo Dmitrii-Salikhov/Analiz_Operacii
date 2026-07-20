@@ -7,27 +7,52 @@ from pathlib import Path
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
 
-from analyzers.backup_utils import list_backups, rotate_backups
+from analyzers.backup_utils import (
+    DEFAULT_BACKUP_KEEP,
+    backups_dir,
+    list_backups,
+    make_backup,
+    rotate_backups,
+)
 from analyzers.write_verify import format_verify_message, verify_write_report
 
 
-def test_rotate_backups(tmp_path):
+def test_make_backup_goes_to_backups_folder(tmp_path):
     summary = tmp_path / "Операции сводная 2026.xlsx"
     summary.write_bytes(b"PK\x03\x04fake")
-    created = []
-    for i in range(5):
-        bak = tmp_path / f"Операции сводная 2026.2026010{i}_120000.bak.xlsx"
+    bak = make_backup(summary, keep=20)
+    assert bak is not None
+    assert bak.parent == backups_dir(summary)
+    assert bak.parent.name == "backups"
+    assert bak.exists()
+    assert bak.parent.exists()
+
+
+def test_rotate_backups_keep_20(tmp_path):
+    summary = tmp_path / "Операции сводная 2026.xlsx"
+    summary.write_bytes(b"PK\x03\x04fake")
+    bdir = backups_dir(summary)
+    bdir.mkdir()
+    for i in range(25):
+        bak = bdir / f"Операции сводная 2026.202601{i:02d}_120000.bak.xlsx"
         bak.write_text(f"bak{i}")
-        created.append(bak)
-    removed = rotate_backups(summary, keep=2)
-    assert len(removed) == 3
+    removed = rotate_backups(summary, keep=DEFAULT_BACKUP_KEEP)
+    assert len(removed) == 5
     left = list_backups(summary)
-    assert len(left) == 2
+    assert len(left) == 20
+
+
+def test_list_includes_legacy_next_to_file(tmp_path):
+    summary = tmp_path / "Операции сводная 2026.xlsx"
+    summary.write_bytes(b"PK\x03\x04fake")
+    legacy = tmp_path / "Операции сводная 2026.20260101_120000.bak.xlsx"
+    legacy.write_text("old")
+    found = list_backups(summary)
+    assert legacy in found
 
 
 def test_verify_empty_report(tmp_path):
     f = tmp_path / "t.xlsx"
-    # minimal fake — verify should handle missing months
     import openpyxl
 
     wb = openpyxl.Workbook()

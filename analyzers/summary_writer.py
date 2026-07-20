@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import calendar
-import shutil
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -160,15 +159,11 @@ class SummaryWriter:
         out = Path(output_path) if output_path else self.template_path
         report_bak = None
         if backup and out.exists():
-            from datetime import datetime as _dt
+            from analyzers.backup_utils import DEFAULT_BACKUP_KEEP, make_backup
 
-            from analyzers.backup_utils import rotate_backups
-
-            stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
-            bak = out.with_name(f"{out.stem}.{stamp}.bak{out.suffix}")
-            shutil.copy2(out, bak)
-            report_bak = str(bak)
-            rotate_backups(out, keep=int(self.cfg.get("backup_keep", 10)))
+            report_bak = str(
+                make_backup(out, keep=int(self.cfg.get("backup_keep", DEFAULT_BACKUP_KEEP))) or ""
+            ) or None
 
         wb = openpyxl.load_workbook(self.template_path)
         report = {
@@ -177,9 +172,42 @@ class SummaryWriter:
             "cells_written": 0,
             "write_weeks": write_weeks,
             "write_form": write_form,
+            "blank_delta": 0,
         }
         if report_bak:
             report["backup"] = report_bak
+
+        # Ровно одна пустая строка между операциями и «Всего операций»
+        from analyzers.summary_layout import (
+            _classify_sheet,
+            _find_label_row,
+            ensure_one_blank_before_totals,
+        )
+
+        blank_delta_set = False
+        month_name_set = set(self.sheet_names.values())
+        for sn in list(wb.sheetnames):
+            ws = wb[sn]
+            if sn not in month_name_set and not _classify_sheet(sn):
+                if not _find_label_row(ws, "Всего операций"):
+                    continue
+            gap = ensure_one_blank_before_totals(ws)
+            if not blank_delta_set:
+                report["blank_delta"] = int(gap.get("delta") or 0)
+                blank_delta_set = True
+        if report["blank_delta"]:
+            self.children_row = int(self.children_row) + report["blank_delta"]
+            self.patients_row = int(self.patients_row) + report["blank_delta"]
+
+        # Заливка названия (B) и суммы (H) — акцент план/экстр
+        from analyzers.summary_layout import apply_category_kind_fills
+
+        emergency = self.cfg.get("emergency_categories") or []
+        for sn in month_name_set:
+            if sn in wb.sheetnames:
+                apply_category_kind_fills(
+                    wb[sn], self.category_rows, emergency_categories=emergency
+                )
 
         ops = pd.DataFrame() if ops_df is None else ops_df.copy()
         if not ops.empty:
@@ -286,7 +314,7 @@ class SummaryWriter:
         ws.cell(self.patients_row, col).value = None
 
     def _fill_week_column(self, ws, col: int, month_ops: pd.DataFrame, weeks: List[Tuple[date, date]]) -> int:
-        """Пишет все ячейки колонки, включая 0 — чтобы перезапись была видна после очистки."""
+        """Пишет счётчики по категориям; 0 не ставим — ячейка остаётся пустой."""
         idx = col - 3
         if idx < 0 or idx >= len(weeks):
             return 0
@@ -301,7 +329,8 @@ class SummaryWriter:
         counts = week_ops["Категория"].value_counts() if not week_ops.empty else pd.Series(dtype=int)
         for cat, row in self.category_rows.items():
             val = int(counts.get(cat, 0))
-            ws.cell(row, col).value = val
+            # нет операций этой категории — пусто, не ноль
+            ws.cell(row, col).value = val if val else None
             written += 1
 
         if week_ops.empty:
@@ -310,7 +339,8 @@ class SummaryWriter:
         else:
             children = int(week_ops.loc[week_ops["Возраст"].fillna(99) < 18, "КВС"].nunique())
             patients = int(week_ops["КВС"].nunique())
-        ws.cell(self.children_row, col).value = children
-        ws.cell(self.patients_row, col).value = patients
+        # итоги «Дети» / «Человек»: 0 тоже не пишем
+        ws.cell(self.children_row, col).value = children if children else None
+        ws.cell(self.patients_row, col).value = patients if patients else None
         written += 2
         return written

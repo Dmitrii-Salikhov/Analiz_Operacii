@@ -10,6 +10,157 @@ import pandas as pd
 from analyzers.io_utils import find_column
 from analyzers.ksg_catalog import get_catalog
 
+ADENOTOMY_CODES_DEFAULT = {"A16.08.002.001"}
+
+
+def has_adenotomy(
+    companion_codes=None,
+    service_text: str = "",
+    adenotomy_codes: Optional[set] = None,
+) -> bool:
+    codes = set(companion_codes or [])
+    adenotomy = adenotomy_codes or ADENOTOMY_CODES_DEFAULT
+    if codes & adenotomy:
+        return True
+    text = (service_text or "").lower()
+    return "аденоид" in text or "аденотоми" in text
+
+
+def resolve_category(
+    cat: dict,
+    hosp_type: Optional[str],
+    companion_codes=None,
+    service_text: str = "",
+    adenotomy_codes: Optional[set] = None,
+) -> Tuple[str, str, str, bool]:
+    name = cat["category"]
+    emerg_alt = cat.get("emergency_category")
+    if emerg_alt and has_adenotomy(companion_codes, service_text, adenotomy_codes):
+        name = cat["category"]
+    elif emerg_alt and hosp_type == "экстренная":
+        name = emerg_alt
+    return name, cat.get("group", ""), cat.get("line", ""), bool(cat.get("histology", False))
+
+
+def classify_by_name(
+    categories: List[dict],
+    service_text: str,
+    hosp_type: Optional[str] = None,
+    companion_codes=None,
+    adenotomy_codes: Optional[set] = None,
+) -> Tuple[Optional[Tuple[str, str, str, bool]], bool, str]:
+    """
+    Поиск по name_keywords.
+    Возвращает (cat_info | None, спор?, «Кат1 | Кат2»).
+    При ничьей max score — спор=True, назначается первая из лидеров.
+    """
+    text = (service_text or "").lower()
+    scored: List[Tuple[int, dict]] = []
+    for cat in categories or []:
+        kws = cat.get("name_keywords") or []
+        if not kws:
+            continue
+        score = sum(1 for kw in kws if str(kw).lower() in text)
+        if score > 0:
+            scored.append((score, cat))
+    if not scored:
+        return None, False, ""
+    max_score = max(s for s, _ in scored)
+    tops = [c for s, c in scored if s == max_score]
+    disputed = len(tops) > 1
+    names: List[str] = []
+    for c in tops:
+        resolved_name, *_ = resolve_category(
+            c,
+            hosp_type,
+            companion_codes=companion_codes,
+            service_text=service_text,
+            adenotomy_codes=adenotomy_codes,
+        )
+        if resolved_name not in names:
+            names.append(resolved_name)
+    resolved = resolve_category(
+        tops[0],
+        hosp_type,
+        companion_codes=companion_codes,
+        service_text=service_text,
+        adenotomy_codes=adenotomy_codes,
+    )
+    return resolved, disputed, " | ".join(names)
+
+
+def build_code_index(categories: List[dict]) -> Dict[str, dict]:
+    index: Dict[str, dict] = {}
+    for cat in categories or []:
+        for code in cat.get("codes") or []:
+            index[str(code)] = cat
+    return index
+
+
+def lookup_category_meta(categories: List[dict], category_name: str) -> Optional[dict]:
+    needle = str(category_name or "").strip()
+    for cat in categories or []:
+        if str(cat.get("category") or "").strip() == needle:
+            return cat
+        emerg = str(cat.get("emergency_category") or "").strip()
+        if emerg and emerg == needle:
+            return cat
+    return None
+
+
+def reclassify_ops_by_keywords(ops: pd.DataFrame, categories: List[dict]) -> pd.DataFrame:
+    """
+    Переклассификация строк без Ручная_категория:
+    — код не в индексе / пустой код / спор / «Не классифицировано».
+    """
+    if ops is None or ops.empty:
+        return ops
+    df = ops.copy()
+    if "Ручная_категория" not in df.columns:
+        df["Ручная_категория"] = False
+    if "Спор_ключей" not in df.columns:
+        df["Спор_ключей"] = False
+    if "Спорные_категории" not in df.columns:
+        df["Спорные_категории"] = ""
+
+    code_index = build_code_index(categories)
+    for i in df.index:
+        if bool(df.at[i, "Ручная_категория"]):
+            continue
+        code = str(df.at[i, "Код"] or "").strip()
+        cat_name = str(df.at[i, "Категория"] or "")
+        disputed = bool(df.at[i, "Спор_ключей"])
+        known_code = bool(code) and code in code_index
+        if known_code and not disputed and cat_name != "Не классифицировано":
+            continue
+        text = str(df.at[i, "Услуга"] or "")
+        hosp = df.at[i, "Тип_ЭМК"] if "Тип_ЭМК" in df.columns else None
+        hosp_s = str(hosp).strip().lower() if hosp is not None and str(hosp).strip() else None
+        if known_code:
+            # код есть, но спор/некласс — уточняем по имени
+            info, disp, cands = classify_by_name(categories, text, hosp_s)
+        elif code and code not in code_index:
+            info, disp, cands = classify_by_name(categories, text, hosp_s)
+        else:
+            info, disp, cands = classify_by_name(categories, text, hosp_s)
+        if info is None:
+            if not known_code:
+                df.at[i, "Категория"] = "Не классифицировано"
+                df.at[i, "Группа"] = "прочее"
+                df.at[i, "Строка_4001"] = ""
+                df.at[i, "Гистология"] = False
+            df.at[i, "Спор_ключей"] = False
+            df.at[i, "Спорные_категории"] = ""
+            continue
+        name, group, line, hist = info
+        df.at[i, "Категория"] = name
+        df.at[i, "Группа"] = group
+        df.at[i, "Строка_4001"] = line
+        df.at[i, "Гистология"] = hist
+        df.at[i, "Спор_ключей"] = bool(disp)
+        df.at[i, "Спорные_категории"] = cands or ""
+    return df
+
 
 class SurgeryAnalyzer:
     def __init__(self, df: pd.DataFrame, department: str, categories_config: List[dict], emk_df=None):
@@ -44,11 +195,7 @@ class SurgeryAnalyzer:
         self._emk_hosp_index = self._build_emk_hosp_index()
 
     def _build_code_index(self) -> Dict[str, dict]:
-        index = {}
-        for cat in self.categories:
-            for code in cat.get("codes") or []:
-                index[code] = cat
-        return index
+        return build_code_index(self.categories)
 
     def _build_emk_hosp_index(self) -> Dict[Any, List[dict]]:
         """КВС → список госпитализаций из ЭМК (для миринготомии и сверки)."""
@@ -119,18 +266,59 @@ class SurgeryAnalyzer:
 
             if codes:
                 for code in codes:
-                    cat_info = self._classify(code, text, hosp_type, companion_codes=codes)
-                    ops.append(self._op_dict(row, code, cat_info, surgeon, table, hosp_type, diagnosis, text))
+                    cat_info, disputed, candidates = self._classify(
+                        code, text, hosp_type, companion_codes=codes
+                    )
+                    ops.append(
+                        self._op_dict(
+                            row,
+                            code,
+                            cat_info,
+                            surgeon,
+                            table,
+                            hosp_type,
+                            diagnosis,
+                            text,
+                            disputed=disputed,
+                            candidates=candidates,
+                        )
+                    )
             else:
-                cat_info = self._classify_by_name(text, hosp_type)
+                cat_info, disputed, candidates = self._classify_by_name(text, hosp_type)
                 if cat_info is None:
                     continue
-                ops.append(self._op_dict(row, "", cat_info, surgeon, table, hosp_type, diagnosis, text))
+                ops.append(
+                    self._op_dict(
+                        row,
+                        "",
+                        cat_info,
+                        surgeon,
+                        table,
+                        hosp_type,
+                        diagnosis,
+                        text,
+                        disputed=disputed,
+                        candidates=candidates,
+                    )
+                )
 
         result = pd.DataFrame(ops)
         return self._force_myringotomy_plan_with_adenotomy(result)
 
-    def _op_dict(self, row, code, cat_info, surgeon, table, hosp_type, diagnosis, service_text):
+    def _op_dict(
+        self,
+        row,
+        code,
+        cat_info,
+        surgeon,
+        table,
+        hosp_type,
+        diagnosis,
+        service_text,
+        *,
+        disputed: bool = False,
+        candidates: str = "",
+    ):
         if cat_info is None:
             cat_name, group, line, hist = "Не классифицировано", "прочее", "", False
         else:
@@ -157,39 +345,38 @@ class SurgeryAnalyzer:
             "КСГ_название": ksg_name,
             "КСГ": ksg_groups,
             "КСГ_подсказка": ksg_hint,
+            "Спор_ключей": bool(disputed),
+            "Спорные_категории": candidates or "",
+            "Ручная_категория": False,
         }
 
     # Код аденотомии: миринготомия в одной операции / в тот же день → всегда плановая
     ADENOTOMY_CODES = {"A16.08.002.001"}
 
-    def _classify(self, code: str, service_text: str, hosp_type: Optional[str], companion_codes=None):
+    def _classify(
+        self, code: str, service_text: str, hosp_type: Optional[str], companion_codes=None
+    ) -> Tuple[Optional[Tuple[str, str, str, bool]], bool, str]:
         cat = self._code_index.get(code)
         if cat is None:
             return self._classify_by_name(service_text, hosp_type, companion_codes=companion_codes)
-        return self._resolve_category(cat, hosp_type, companion_codes=companion_codes, service_text=service_text)
+        resolved = self._resolve_category(
+            cat, hosp_type, companion_codes=companion_codes, service_text=service_text
+        )
+        return resolved, False, ""
 
-    def _classify_by_name(self, service_text: str, hosp_type: Optional[str], companion_codes=None):
-        text = (service_text or "").lower()
-        best = None
-        best_score = 0
-        for cat in self.categories:
-            kws = cat.get("name_keywords") or []
-            if not kws:
-                continue
-            score = sum(1 for kw in kws if kw.lower() in text)
-            if score > best_score:
-                best_score = score
-                best = cat
-        if best is None or best_score == 0:
-            return None
-        return self._resolve_category(best, hosp_type, companion_codes=companion_codes, service_text=service_text)
+    def _classify_by_name(
+        self, service_text: str, hosp_type: Optional[str], companion_codes=None
+    ) -> Tuple[Optional[Tuple[str, str, str, bool]], bool, str]:
+        return classify_by_name(
+            self.categories,
+            service_text,
+            hosp_type,
+            companion_codes=companion_codes,
+            adenotomy_codes=self.ADENOTOMY_CODES,
+        )
 
     def _has_adenotomy(self, companion_codes=None, service_text: str = "") -> bool:
-        codes = set(companion_codes or [])
-        if codes & self.ADENOTOMY_CODES:
-            return True
-        text = (service_text or "").lower()
-        return "аденоид" in text or "аденотоми" in text
+        return has_adenotomy(companion_codes, service_text, self.ADENOTOMY_CODES)
 
     def _resolve_category(
         self,
@@ -198,14 +385,13 @@ class SurgeryAnalyzer:
         companion_codes=None,
         service_text: str = "",
     ) -> Tuple[str, str, str, bool]:
-        name = cat["category"]
-        emerg_alt = cat.get("emergency_category")
-        # Миринготомия вместе с аденотомией — всегда плановая
-        if emerg_alt and self._has_adenotomy(companion_codes, service_text):
-            name = cat["category"]  # «Миринготомия план»
-        elif emerg_alt and hosp_type == "экстренная":
-            name = emerg_alt
-        return name, cat.get("group", ""), cat.get("line", ""), bool(cat.get("histology", False))
+        return resolve_category(
+            cat,
+            hosp_type,
+            companion_codes=companion_codes,
+            service_text=service_text,
+            adenotomy_codes=self.ADENOTOMY_CODES,
+        )
 
     def _force_myringotomy_plan_with_adenotomy(self, ops_df: pd.DataFrame) -> pd.DataFrame:
         """Если в тот же день у того же КВС есть аденотомия — миринготомия → план."""

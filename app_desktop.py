@@ -27,9 +27,31 @@ from analyzers.export_report import export_month_like_summary
 from analyzers.file_lock import excel_file_locked
 from analyzers.form_4001 import compute_form_4001, form_4001_preview_rows
 from analyzers.io_utils import OperationsStore, read_table
+from analyzers.category_registry import (
+    CategoryRegistryError,
+    CategorySpec,
+    default_anchor_category,
+    register_category,
+    save_config,
+    shift_totals_rows_by_delta,
+    suggest_keywords_from_name,
+    unregister_category,
+    update_category_keywords_file,
+)
+from analyzers.summary_layout import (
+    add_category_row_to_summary,
+    delete_category_row_from_summary,
+    find_anchor_row,
+)
+from analyzers.ksg_catalog import get_catalog
 from analyzers.problem_codes import build_problem_codes_table, format_config_draft
 from analyzers.backup_utils import list_backups, restore_backup
-from analyzers.surgery import SurgeryAnalyzer, build_summary_tables
+from analyzers.surgery import (
+    SurgeryAnalyzer,
+    build_summary_tables,
+    lookup_category_meta,
+    reclassify_ops_by_keywords,
+)
 from analyzers.summary_writer import (
     MONTH_RU,
     SummaryWriter,
@@ -45,6 +67,7 @@ from analyzers.updater import (
     read_local_version,
     resolve_token,
 )
+from analyzers.release_notes import format_whats_new
 from analyzers.write_verify import format_verify_message, verify_write_report
 from analyzers.year_template import create_year_summary, suggest_summary_path
 
@@ -62,6 +85,67 @@ os.chdir(APP_DIR)
 APP_LOG = AppLog(APP_DIR / "analysis.log", max_lines=500)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Палитра светлой / тёмной темы и акцентов кнопок шапки
+UI_THEMES = {
+    "light": {
+        "bg": "#F4F4F4",
+        "fg": "#1A1A1A",
+        "muted": "#555555",
+        "panel": "#FFFFFF",
+        "toolbar": "#EAEAEA",
+        "entry_bg": "#FFFFFF",
+        "entry_fg": "#1A1A1A",
+        "btn_bg": "#E0E0E0",
+        "btn_fg": "#1A1A1A",
+        "btn_active": "#D0D0D0",
+        "primary_bg": "#A5D6A7",
+        "primary_fg": "#1B5E20",
+        "primary_active": "#81C784",
+        "emk_bg": "#FFCC80",
+        "emk_fg": "#E65100",
+        "emk_active": "#FFB74D",
+        "status_bg": "#E8E8E8",
+        "select_bg": "#BBDEFB",
+        "heading_bg": "#E8E8E8",
+        "heading_fg": "#1A1A1A",
+        "tab_bg": "#E0E0E0",
+        "tab_fg": "#1A1A1A",
+        "tab_selected_bg": "#FFFFFF",
+        "combo_bg": "#FFFFFF",
+        "combo_fg": "#1A1A1A",
+    },
+    "dark": {
+        "bg": "#2B2B2B",
+        "fg": "#EDEDED",
+        "muted": "#A0A0A0",
+        "panel": "#333333",
+        "toolbar": "#3A3A3A",
+        "entry_bg": "#424242",
+        "entry_fg": "#EDEDED",
+        # кнопки шапки в тёмной теме: белый фон, чёрный текст
+        "btn_bg": "#FFFFFF",
+        "btn_fg": "#000000",
+        "btn_active": "#F0F0F0",
+        "primary_bg": "#FFFFFF",
+        "primary_fg": "#000000",
+        "primary_active": "#E8F5E9",
+        "emk_bg": "#FFFFFF",
+        "emk_fg": "#000000",
+        "emk_active": "#FFE0B2",
+        "status_bg": "#3A3A3A",
+        "select_bg": "#1565C0",
+        # шапка таблиц и вкладки-переключатели: чёрный текст
+        "heading_bg": "#F0F0F0",
+        "heading_fg": "#000000",
+        "tab_bg": "#FFFFFF",
+        "tab_fg": "#000000",
+        "tab_selected_bg": "#FFFFFF",
+        # отделение / месяц — белое поле, чёрный текст
+        "combo_bg": "#FFFFFF",
+        "combo_fg": "#000000",
+    },
+}
 
 
 def _btn(parent, text, command, **pack):
@@ -114,7 +198,16 @@ class DesktopApp:
         self.loaded_department = None
         self.summary_paths_by_dept = {}
         self.last_update_check = ""
+        self.last_seen_version = ""
         self._prev_dept = None
+        self.theme_var = StringVar(value="light")
+        self._role_buttons: list = []
+        self._theme_labels: list = []
+        self._theme_frames: list = []
+        self._theme_entries: list = []
+        self._theme_checks: list = []
+        self._theme_radios: list = []
+        self._theme_texts: list = []
 
         self._apply_saved_settings()
         self._prev_dept = self.dept_var.get()
@@ -129,12 +222,14 @@ class DesktopApp:
 
         self._build_menu()
         self._build_layout()
+        self._apply_theme()
         self._set_date_widgets_state("normal" if self.filter_enabled.get() else "disabled")
         self._bind_shortcuts()
         self._refresh_sources_list()
         self._load_log_into_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.log_message("Приложение готово. Нажмите «Опержурнал(ы)» для загрузки.")
+        self.root.after(600, self._maybe_show_whats_new)
         self.root.after(900, self._maybe_startup_update_check)
 
     def load_config(self):
@@ -162,12 +257,15 @@ class DesktopApp:
         file_m.add_command(label="Создать сводную на год…", command=self.create_year_summary_dialog)
         file_m.add_command(label="Экспорт неклассифицированных…", command=self.export_unclassified)
         file_m.add_command(label="Экспорт проблемных кодов…", command=self.export_problem_codes)
+        file_m.add_command(label="Добавить операцию в отчёт…", command=self.add_category_dialog)
+        file_m.add_command(label="Удалить операцию из отчёта…", command=self.delete_category_dialog)
         file_m.add_separator()
         file_m.add_command(label="Очистить", command=self.clear_store)
         file_m.add_command(label="Выход", command=self._on_close)
         bar.add_cascade(label="Файл", menu=file_m)
         help_m = Menu(bar, tearoff=0)
         help_m.add_command(label="Проверить обновления…", command=lambda: self.check_updates(force=True))
+        help_m.add_command(label="Что нового…", command=lambda: self.show_whats_new(force=True))
         help_m.add_command(label="О программе", command=self.show_about)
         bar.add_cascade(label="Помощь", menu=help_m)
 
@@ -179,54 +277,316 @@ class DesktopApp:
         self.root.bind("<Command-c>", self._copy_focused_tree)
         self.root.bind("<Control-c>", self._copy_focused_tree)
 
+    def _tool_btn(self, parent, text, command, role: str = "default", **pack):
+        b = tk.Button(parent, text=text, command=command, padx=8, pady=4)
+        self._role_buttons.append((b, role))
+        b.pack(**pack)
+        return b
+
+    def _theme_label(self, parent, text, muted: bool = False, **kwargs):
+        lbl = tk.Label(parent, text=text, **kwargs)
+        self._theme_labels.append((lbl, muted))
+        return lbl
+
+    def _theme_toggle_label(self) -> str:
+        return "Светлая" if self.theme_var.get() == "dark" else "Тёмная"
+
+    def _toggle_theme(self):
+        self.theme_var.set("dark" if self.theme_var.get() == "light" else "light")
+        if getattr(self, "theme_btn", None) is not None:
+            self.theme_btn.config(text=self._theme_toggle_label())
+        self._apply_theme()
+        self._persist_settings()
+
+    def _current_theme(self) -> dict:
+        key = self.theme_var.get() if self.theme_var.get() in UI_THEMES else "light"
+        return UI_THEMES[key]
+
+    def _apply_theme(self):
+        t = self._current_theme()
+        try:
+            self.root.configure(bg=t["bg"])
+        except tk.TclError:
+            pass
+        if getattr(self, "status_bar", None) is not None:
+            self.status_bar.configure(bg=t["status_bg"], fg=t["fg"])
+
+        for fr in self._theme_frames:
+            try:
+                if isinstance(fr, tk.LabelFrame):
+                    fr.configure(bg=t["panel"], fg=t["fg"])
+                else:
+                    fr.configure(bg=t["bg"])
+            except tk.TclError:
+                pass
+
+        # toolbar + два ряда — фон панели инструментов
+        if self._theme_frames:
+            for fr in self._theme_frames[:3]:
+                try:
+                    fr.configure(bg=t["toolbar"])
+                except tk.TclError:
+                    pass
+
+        for lbl, muted in self._theme_labels:
+            try:
+                parent_bg = t["bg"]
+                try:
+                    pbg = lbl.master.cget("bg")
+                    if pbg:
+                        parent_bg = pbg
+                except Exception:
+                    pass
+                lbl.configure(bg=parent_bg, fg=t["muted"] if muted else t["fg"])
+            except tk.TclError:
+                pass
+
+        for b, role in self._role_buttons:
+            try:
+                if role == "primary":
+                    b.configure(
+                        bg=t["primary_bg"],
+                        fg=t["primary_fg"],
+                        activebackground=t["primary_active"],
+                        activeforeground=t["primary_fg"],
+                        highlightbackground=t["primary_bg"],
+                    )
+                elif role == "emk":
+                    b.configure(
+                        bg=t["emk_bg"],
+                        fg=t["emk_fg"],
+                        activebackground=t["emk_active"],
+                        activeforeground=t["emk_fg"],
+                        highlightbackground=t["emk_bg"],
+                    )
+                else:
+                    b.configure(
+                        bg=t["btn_bg"],
+                        fg=t["btn_fg"],
+                        activebackground=t["btn_active"],
+                        activeforeground=t["btn_fg"],
+                        highlightbackground=t["btn_bg"],
+                    )
+            except tk.TclError:
+                pass
+
+        # ttk notebook / combobox
+        try:
+            style = ttk.Style(self.root)
+            try:
+                style.theme_use("clam")
+            except tk.TclError:
+                pass
+            style.configure(".", background=t["bg"], foreground=t["fg"], fieldbackground=t["entry_bg"])
+            style.configure("TFrame", background=t["bg"])
+            style.configure("TLabel", background=t["bg"], foreground=t["fg"])
+            style.configure("TNotebook", background=t["bg"])
+            style.configure(
+                "TNotebook.Tab",
+                background=t["tab_bg"],
+                foreground=t["tab_fg"],
+                padding=[8, 4],
+            )
+            style.map(
+                "TNotebook.Tab",
+                background=[("selected", t["tab_selected_bg"])],
+                foreground=[("selected", t["tab_fg"])],
+            )
+            style.configure(
+                "TCombobox",
+                fieldbackground=t["combo_bg"],
+                foreground=t["combo_fg"],
+                background=t["combo_bg"],
+                arrowcolor=t["combo_fg"],
+            )
+            style.map(
+                "TCombobox",
+                fieldbackground=[("readonly", t["combo_bg"]), ("!disabled", t["combo_bg"])],
+                foreground=[("readonly", t["combo_fg"]), ("!disabled", t["combo_fg"])],
+                selectbackground=[("readonly", t["combo_bg"])],
+                selectforeground=[("readonly", t["combo_fg"])],
+            )
+            # выпадающий список combobox (macOS/clam)
+            try:
+                self.root.option_add("*TCombobox*Listbox.background", t["combo_bg"])
+                self.root.option_add("*TCombobox*Listbox.foreground", t["combo_fg"])
+                self.root.option_add("*TCombobox*Listbox.selectBackground", t["select_bg"])
+                self.root.option_add("*TCombobox*Listbox.selectForeground", t["combo_fg"])
+            except tk.TclError:
+                pass
+            # тело таблицы — по теме; шапка колонок — чёрный текст
+            style.configure(
+                "Treeview",
+                background=t["panel"],
+                foreground=t["fg"],
+                fieldbackground=t["panel"],
+            )
+            style.configure(
+                "Treeview.Heading",
+                background=t["heading_bg"],
+                foreground=t["heading_fg"],
+            )
+            style.map("Treeview", background=[("selected", t["select_bg"])])
+            style.map("Treeview.Heading", foreground=[("active", t["heading_fg"])])
+        except tk.TclError:
+            pass
+
+        # рекурсивно подкрасить основные контейнеры под notebook / settings
+        self._paint_tk_tree(self.root, t, skip_buttons=True)
+        self._apply_combo_caption_colors(t)
+
+    def _apply_combo_caption_colors(self, t: dict) -> None:
+        """Подписи «Отделение» / «Месяц» / «Год» — белые в тёмной теме (поля списков не трогаем)."""
+        for attr in ("dept_caption", "month_caption", "year_caption"):
+            lbl = getattr(self, attr, None)
+            if lbl is None:
+                continue
+            try:
+                bg = t["bg"]
+                try:
+                    bg = lbl.master.cget("bg") or bg
+                except Exception:
+                    pass
+                lbl.configure(bg=bg, fg=t["fg"])
+            except tk.TclError:
+                pass
+
+    def _paint_tk_tree(self, widget, t: dict, skip_buttons: bool = False):
+        for child in widget.winfo_children():
+            cls = child.winfo_class()
+            try:
+                if cls in ("Frame", "Labelframe", "Toplevel"):
+                    if isinstance(child, tk.LabelFrame):
+                        child.configure(bg=t["panel"], fg=t["fg"])
+                    elif child not in self._theme_frames[:3]:
+                        child.configure(bg=t["bg"])
+                    self._paint_tk_tree(child, t, skip_buttons=skip_buttons)
+                elif cls == "Label":
+                    # уже в _theme_labels или нет — подогнать фон родителя
+                    if not any(child is x for x, _ in self._theme_labels):
+                        muted = str(child.cget("fg") or "") in ("#555", "#666", "#A0A0A0")
+                        bg = t["bg"]
+                        try:
+                            bg = child.master.cget("bg") or bg
+                        except Exception:
+                            pass
+                        child.configure(bg=bg, fg=t["muted"] if muted else t["fg"])
+                elif cls == "Button" and not skip_buttons:
+                    if not any(child is b for b, _ in self._role_buttons):
+                        child.configure(
+                            bg=t["btn_bg"],
+                            fg=t["btn_fg"],
+                            activebackground=t["btn_active"],
+                            activeforeground=t["btn_fg"],
+                        )
+                elif cls == "Entry":
+                    child.configure(
+                        bg=t["entry_bg"],
+                        fg=t["entry_fg"],
+                        insertbackground=t["entry_fg"],
+                    )
+                elif cls in ("Checkbutton", "Radiobutton"):
+                    bg = t["bg"]
+                    try:
+                        bg = child.master.cget("bg") or bg
+                    except Exception:
+                        pass
+                    child.configure(
+                        bg=bg,
+                        fg=t["fg"],
+                        activebackground=bg,
+                        activeforeground=t["fg"],
+                        selectcolor=t["panel"],
+                    )
+                elif cls == "Text":
+                    child.configure(
+                        bg=t["panel"],
+                        fg=t["fg"],
+                        insertbackground=t["fg"],
+                    )
+                elif cls in ("TFrame", "TNotebook", "Treeview"):
+                    self._paint_tk_tree(child, t, skip_buttons=skip_buttons)
+                else:
+                    self._paint_tk_tree(child, t, skip_buttons=skip_buttons)
+            except tk.TclError:
+                try:
+                    self._paint_tk_tree(child, t, skip_buttons=skip_buttons)
+                except Exception:
+                    pass
+
     def _build_layout(self):
         # ВАЖНО для macOS Tk: виджеты side=BOTTOM паковать ПЕРВЫМИ,
         # иначе expand-область «съедает» окно и оно выглядит пустым.
-        tk.Label(self.root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor="w").pack(
-            fill=tk.X, side=tk.BOTTOM
+        self.status_bar = tk.Label(
+            self.root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor="w"
         )
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
-        # --- кнопки сверху ---
+        # --- шапка: два ряда кнопок ---
         toolbar = tk.Frame(self.root, bd=1, relief=tk.RAISED)
         toolbar.pack(fill=tk.X, padx=4, pady=4, side=tk.TOP)
-        tk.Label(toolbar, text="Действия:", font=("Helvetica", 12, "bold")).pack(side=tk.LEFT, padx=6)
-        for text, cmd in (
-            ("Опержурнал(ы)", self.load_surg),
-            ("Из папки…", self.load_surg_folder),
-            ("ЭМК", self.load_emk),
-            ("Обновить превью", self.run_analysis),
-            ("Записать в Excel…", self.update_summary),
-            ("Открыть Excel", self.open_summary_file),
-            ("Бэкап…", self.restore_summary_backup),
-            ("Расхождения ЭМК", self.show_emk_diff),
-            ("Очистить", self.clear_store),
-        ):
-            _btn(toolbar, text, cmd, side=tk.LEFT, padx=3, pady=4)
+        self._theme_frames.append(toolbar)
+
+        row1 = tk.Frame(toolbar)
+        row1.pack(fill=tk.X, padx=2, pady=(4, 2))
+        self._theme_frames.append(row1)
+        self._theme_label(row1, "Действия:", font=("Helvetica", 12, "bold")).pack(side=tk.LEFT, padx=6)
+        # основные — зелёные
+        self._tool_btn(row1, "Опержурнал(ы)", self.load_surg, role="primary", side=tk.LEFT, padx=3, pady=2)
+        self._tool_btn(row1, "Из папки…", self.load_surg_folder, role="primary", side=tk.LEFT, padx=3, pady=2)
+        self._tool_btn(row1, "Записать в Excel…", self.update_summary, role="primary", side=tk.LEFT, padx=3, pady=2)
+        self._tool_btn(row1, "Открыть Excel", self.open_summary_file, role="primary", side=tk.LEFT, padx=3, pady=2)
+        self._tool_btn(row1, "Обновить превью", self.run_analysis, side=tk.LEFT, padx=3, pady=2)
+        self._tool_btn(row1, "Бэкап…", self.restore_summary_backup, side=tk.LEFT, padx=3, pady=2)
+        self._tool_btn(row1, "Очистить", self.clear_store, side=tk.LEFT, padx=3, pady=2)
+
+        row2 = tk.Frame(toolbar)
+        row2.pack(fill=tk.X, padx=2, pady=(2, 4))
+        self._theme_frames.append(row2)
+        self._theme_label(row2, "Операции / ЭМК:", font=("Helvetica", 12, "bold")).pack(side=tk.LEFT, padx=6)
+        self._tool_btn(row2, "Добавить операцию…", self.add_category_dialog, side=tk.LEFT, padx=3, pady=2)
+        self._tool_btn(row2, "Удалить операцию…", self.delete_category_dialog, side=tk.LEFT, padx=3, pady=2)
+        # ЭМК — светло-оранжевые
+        self._tool_btn(row2, "ЭМК", self.load_emk, role="emk", side=tk.LEFT, padx=3, pady=2)
+        self._tool_btn(row2, "Расхождения ЭМК", self.show_emk_diff, role="emk", side=tk.LEFT, padx=3, pady=2)
+        self._theme_label(row2, "Тема:").pack(side=tk.LEFT, padx=(16, 4))
+        self.theme_btn = self._tool_btn(
+            row2, self._theme_toggle_label(), self._toggle_theme, side=tk.LEFT, padx=3, pady=2
+        )
 
         # --- заголовок / отделение ---
         top = tk.Frame(self.root)
         top.pack(fill=tk.X, padx=8, pady=2)
-        tk.Label(top, text="Сводная операционной деятельности", font=("Helvetica", 14, "bold")).pack(side=tk.LEFT)
-        tk.Label(
+        self._theme_frames.append(top)
+        self._theme_label(top, "Сводная операционной деятельности", font=("Helvetica", 14, "bold")).pack(
+            side=tk.LEFT
+        )
+        self._theme_label(
             top,
-            text=f"  v{getattr(self, 'app_version', read_local_version(APP_DIR))}",
+            f"  v{getattr(self, 'app_version', read_local_version(APP_DIR))}",
             font=("Helvetica", 12),
-            fg="#555",
+            muted=True,
         ).pack(side=tk.LEFT, padx=(4, 12))
-        tk.Label(top, text="Отделение:").pack(side=tk.LEFT)
+        self.dept_caption = self._theme_label(top, "Отделение:")
+        self.dept_caption.pack(side=tk.LEFT)
         dept_list = self.config["departments"]["list"]
         self.dept_combo = ttk.Combobox(top, textvariable=self.dept_var, values=dept_list, width=40, state="readonly")
         self.dept_combo.pack(side=tk.LEFT, padx=4)
         self.dept_combo.bind("<<ComboboxSelected>>", lambda e: self._on_department_changed())
         self.dept_hint_var = StringVar(value="")
-        tk.Label(top, textvariable=self.dept_hint_var, fg="#666", wraplength=420, justify=tk.LEFT).pack(
-            side=tk.LEFT, padx=(8, 0)
+        self.dept_hint_lbl = tk.Label(
+            top, textvariable=self.dept_hint_var, wraplength=420, justify=tk.LEFT
         )
+        self.dept_hint_lbl.pack(side=tk.LEFT, padx=(8, 0))
+        self._theme_labels.append((self.dept_hint_lbl, True))
         self._refresh_dept_hint()
 
         # --- KPI ---
         kpi = tk.LabelFrame(self.root, text="Сводка", padx=6, pady=4)
         kpi.pack(fill=tk.X, padx=8, pady=4)
+        self._theme_frames.append(kpi)
+        self._kpi_title_labels = []
+        self._kpi_value_labels = []
         for i, (title, var) in enumerate(
             (
                 ("Операций", self.kpi_ops_var),
@@ -240,8 +600,13 @@ class DesktopApp:
         ):
             f = tk.Frame(kpi)
             f.grid(row=0, column=i, padx=8, sticky="w")
-            tk.Label(f, text=title, fg="#555").pack(anchor="w")
-            tk.Label(f, textvariable=var, font=("Helvetica", 14, "bold")).pack(anchor="w")
+            self._theme_frames.append(f)
+            lt = tk.Label(f, text=title)
+            lt.pack(anchor="w")
+            self._theme_labels.append((lt, True))
+            lv = tk.Label(f, textvariable=var, font=("Helvetica", 14, "bold"))
+            lv.pack(anchor="w")
+            self._theme_labels.append((lv, False))
 
         # --- настройки ---
         opts = tk.LabelFrame(self.root, text="Настройки", padx=6, pady=4)
@@ -269,11 +634,13 @@ class DesktopApp:
         tk.Checkbutton(
             r1, text="Скрыть нулевые", variable=self.hide_zeros, command=self.refresh_preview
         ).pack(side=tk.LEFT, padx=(12, 0))
-        tk.Label(r1, text="Месяц:").pack(side=tk.LEFT, padx=(12, 2))
+        self.month_caption = tk.Label(r1, text="Месяц:")
+        self.month_caption.pack(side=tk.LEFT, padx=(12, 2))
         self.month_combo = ttk.Combobox(r1, textvariable=self.preview_month, width=16, state="readonly")
         self.month_combo.pack(side=tk.LEFT)
         self.month_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_preview())
-        tk.Label(r1, text="Год:").pack(side=tk.LEFT, padx=(12, 2))
+        self.year_caption = tk.Label(r1, text="Год:")
+        self.year_caption.pack(side=tk.LEFT, padx=(12, 2))
         self.year_combo = ttk.Combobox(
             r1, textvariable=self.year_var, width=6, values=[str(y) for y in range(2024, 2036)]
         )
@@ -332,12 +699,14 @@ class DesktopApp:
         self.tab_preview = self.tab_preview_cat
         self.tab_emk = tk.Frame(self.notebook)
         self.tab_uncl = tk.Frame(self.notebook)
+        self.tab_dispute = tk.Frame(self.notebook)
         self.tab_log = tk.Frame(self.notebook)
         self.notebook.add(self.tab_preview_cat, text="Превью: категории")
         self.notebook.add(self.tab_preview_tot, text="Превью: итоги")
         self.notebook.add(self.tab_preview_form, text="Превью: форма 4001")
         self.notebook.add(self.tab_emk, text="Расхождения ЭМК")
         self.notebook.add(self.tab_uncl, text="Не классифицировано")
+        self.notebook.add(self.tab_dispute, text="Спорные")
         self.notebook.add(self.tab_log, text="Журнал")
 
         pbtns = tk.Frame(self.tab_preview_cat)
@@ -378,6 +747,7 @@ class DesktopApp:
         uncl_top.pack(fill=tk.X, pady=2)
         _btn(uncl_top, "Экспорт списка…", self.export_unclassified, side=tk.LEFT, padx=2)
         _btn(uncl_top, "Экспорт проблемных кодов…", self.export_problem_codes, side=tk.LEFT, padx=2)
+        _btn(uncl_top, "Править ключи…", self.edit_keywords_dialog, side=tk.LEFT, padx=2)
         uncl_cols = ("Дата", "КВС", "Код", "Название КСГ", "КСГ", "Услуга")
         uncl_body = tk.Frame(self.tab_uncl)
         uncl_body.pack(fill=tk.BOTH, expand=True)
@@ -389,6 +759,28 @@ class DesktopApp:
         self.tree_uncl.configure(yscrollcommand=vs.set)
         self.tree_uncl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vs.pack(side=tk.RIGHT, fill=tk.Y)
+
+        disp_top = tk.Frame(self.tab_dispute)
+        disp_top.pack(fill=tk.X, pady=2)
+        _btn(disp_top, "Назначить категорию…", self.assign_disputed_category_dialog, side=tk.LEFT, padx=2)
+        _btn(disp_top, "Править ключи…", self.edit_keywords_dialog_from_dispute, side=tk.LEFT, padx=2)
+        self.dispute_info = StringVar(
+            value="Операции, где несколько категорий набрали одинаковый счёт по ключам"
+        )
+        tk.Label(self.tab_dispute, textvariable=self.dispute_info, anchor="w", fg="#555").pack(
+            fill=tk.X, padx=2
+        )
+        disp_cols = ("Дата", "КВС", "Код", "Услуга", "Категория", "Кандидаты")
+        disp_body = tk.Frame(self.tab_dispute)
+        disp_body.pack(fill=tk.BOTH, expand=True)
+        self.tree_dispute = ttk.Treeview(disp_body, columns=disp_cols, show="headings")
+        for c, w in zip(disp_cols, (90, 90, 110, 280, 140, 220)):
+            self.tree_dispute.heading(c, text=c)
+            self.tree_dispute.column(c, width=w, anchor="w")
+        dvs = ttk.Scrollbar(disp_body, orient=tk.VERTICAL, command=self.tree_dispute.yview)
+        self.tree_dispute.configure(yscrollcommand=dvs.set)
+        self.tree_dispute.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        dvs.pack(side=tk.RIGHT, fill=tk.Y)
 
         log_top = tk.Frame(self.tab_log)
         log_top.pack(fill=tk.X, pady=2)
@@ -833,6 +1225,8 @@ class DesktopApp:
                 self.emk_info.set("Загрузите ЭМК и опержурнал, затем обновите сверку")
             if hasattr(self, "tab_uncl"):
                 self.notebook.tab(self.tab_uncl, text="Не классифицировано")
+            if hasattr(self, "tab_dispute"):
+                self.notebook.tab(self.tab_dispute, text="Спорные")
             self.log_message("Накопитель очищен")
             self.status_var.set("Очищено")
 
@@ -843,6 +1237,7 @@ class DesktopApp:
             getattr(self, "tree_form", None),
             getattr(self, "tree_emk", None),
             getattr(self, "tree_uncl", None),
+            getattr(self, "tree_dispute", None),
         ):
             if tree is None:
                 continue
@@ -1000,6 +1395,10 @@ class DesktopApp:
                                 self.log_message(f"    {code}: {hint}")
                             else:
                                 self.log_message(f"    {code}: нет в KSGoperacii.csv — добавьте в config.yaml")
+                    if "Спор_ключей" in ops.columns:
+                        n_disp = int(ops["Спор_ключей"].fillna(False).astype(bool).sum())
+                        if n_disp:
+                            self.log_message(f"  спорных по ключам: {n_disp} (вкладка «Спорные»)")
                 except Exception as e:
                     messagebox.showerror("Ошибка", f"{os.path.basename(path)}:\n{e}")
                     logging.error(traceback.format_exc())
@@ -1043,6 +1442,7 @@ class DesktopApp:
             self._update_month_choices(ops)
             self.refresh_preview()
             self._update_unclassified(ops)
+            self._update_disputed(ops)
             self._update_kpis(ops, totals_df)
             self._maybe_update_emk_kpi(ops)
             self.status_var.set(f"Готово: {len(ops)} операций, {len(weeks)} нед.")
@@ -1315,6 +1715,7 @@ class DesktopApp:
             month_ops,
             self.config.get("surgery_categories", []),
             pension_age=int(self.config.get("thresholds", {}).get("pension_age", 60)),
+            form_cfg=form_cfg,
         )
         # Колонки как в шаблоне: 1,2,3,4,5,6,28 + S (т.4000)
         form_cols = ["c0", "line", "n", "o", "p", "q", "r", "s"]
@@ -1387,6 +1788,32 @@ class DesktopApp:
                 ),
             )
 
+    def _update_disputed(self, ops):
+        for item in self.tree_dispute.get_children():
+            self.tree_dispute.delete(item)
+        if ops is None or ops.empty or "Спор_ключей" not in ops.columns:
+            self.notebook.tab(self.tab_dispute, text="Спорные")
+            return
+        disp = ops[ops["Спор_ключей"].fillna(False).astype(bool)]
+        self.notebook.tab(self.tab_dispute, text=f"Спорные ({len(disp)})")
+        for idx, r in disp.iterrows():
+            dt = r["Дата"]
+            dt_s = dt.strftime("%d.%m.%Y") if hasattr(dt, "strftime") else str(dt)
+            svc = str(r.get("Услуга", "") or "")[:100]
+            self.tree_dispute.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(
+                    dt_s,
+                    r.get("КВС"),
+                    r.get("Код"),
+                    svc,
+                    r.get("Категория"),
+                    r.get("Спорные_категории", ""),
+                ),
+            )
+
     def update_summary(self):
         """Один диалог записи: галочки «Недели» и «Форма 4001»."""
         if self.store.ops.empty:
@@ -1450,7 +1877,7 @@ class DesktopApp:
         )
         tk.Label(
             top,
-            text="Закройте файл в Excel перед записью. Создаётся .bak с датой.",
+            text="Закройте файл в Excel перед записью. Бэкап — в папку backups/ (до 20 шт.).",
             fg="#555",
             wraplength=480,
             justify=tk.LEFT,
@@ -1509,6 +1936,14 @@ class DesktopApp:
                 write_weeks=write_weeks,
                 write_form=write_form,
             )
+            blank_delta = int(report.get("blank_delta") or 0)
+            if blank_delta:
+                shift_totals_rows_by_delta(self.config, blank_delta)
+                save_config(self.config, APP_DIR / "config.yaml")
+                self.summary_cfg = self.config.get("summary", {})
+                self.log_message(
+                    f"Разделитель перед итогами: сдвиг totals_rows на {blank_delta:+d}"
+                )
             months = ", ".join(report.get("months", {}).keys()) or "—"
             self.log_message(
                 f"Сводная обновлена: {months}, ячеек {report.get('cells_written', 0)}, "
@@ -1557,9 +1992,11 @@ class DesktopApp:
             return
         baks = list_backups(path)
         if not baks:
+            from analyzers.backup_utils import backups_dir
+
             messagebox.showinfo(
                 "Бэкапы",
-                f"Рядом с файлом нет бэкапов (.bak.xlsx):\n{Path(path).parent}",
+                f"Нет бэкапов (.bak.xlsx).\nПапка: {backups_dir(path)}",
             )
             return
         top = tk.Toplevel(self.root)
@@ -1567,7 +2004,8 @@ class DesktopApp:
         top.transient(self.root)
         tk.Label(
             top,
-            text="Выберите бэкап (хранятся последние 10). Текущий файл сохранится перед восстановлением.",
+            text="Выберите бэкап (папка backups/, хранятся последние 20). "
+            "Текущий файл сохранится туда же перед восстановлением.",
             wraplength=520,
             justify=tk.LEFT,
         ).pack(padx=12, pady=8, anchor="w")
@@ -1737,12 +2175,16 @@ class DesktopApp:
             ):
                 return
             try:
+                rows_map = self.summary_cfg.get("category_rows") or {}
+                cat_max = max(int(v) for v in rows_map.values()) if rows_map else 37
                 path = create_year_summary(
                     tpl,
                     y,
                     output_path=str(dest),
                     sheet_names=self.summary_cfg.get("sheet_names"),
                     clear_values=True,
+                    category_row_max=cat_max,
+                    totals_rows=self.summary_cfg.get("totals_rows"),
                 )
                 self.year_var.set(str(y))
                 self.summary_cfg["year"] = y
@@ -1852,11 +2294,19 @@ class DesktopApp:
                     f"({report.get('count')} файлов), backup={report.get('backup')}"
                 )
                 top.destroy()
+                new_ver = str(report.get("new_version") or read_local_version(APP_DIR))
+                old_ver = info.local_version
+                self.app_version = new_ver
+                self.root.title(f"Сводная операций  v{new_ver}")
+                self.show_whats_new(
+                    version=new_ver,
+                    previous_version=old_ver,
+                    force=True,
+                    title=f"Установлена версия {new_ver}",
+                )
                 if messagebox.askyesno(
-                    "Готово",
-                    f"Установлена версия {report.get('new_version')}.\n"
-                    f"Файлов: {report.get('count')}.\n\n"
-                    "Перезапустить приложение сейчас?",
+                    "Перезапуск",
+                    f"Версия {new_ver} установлена.\n\nПерезапустить приложение сейчас?",
                 ):
                     self._restart_app()
             except Exception as e:
@@ -1883,6 +2333,72 @@ class DesktopApp:
                     messagebox.showerror("Ошибка", str(e), parent=top)
 
             _btn(bf, "Открыть на GitHub", open_page, side=tk.LEFT, padx=4)
+
+    def show_whats_new(
+        self,
+        version: str | None = None,
+        previous_version: str | None = None,
+        *,
+        force: bool = False,
+        title: str | None = None,
+    ):
+        """Окно с описанием новых функций из RELEASE_NOTES.md."""
+        ver = (version or self.app_version or read_local_version(APP_DIR)).strip()
+        text = format_whats_new(
+            ver,
+            path=APP_DIR / "RELEASE_NOTES.md",
+            previous_version=previous_version,
+        )
+        top = tk.Toplevel(self.root)
+        top.title(title or f"Что нового — v{ver}")
+        top.transient(self.root)
+        top.resizable(True, True)
+        tk.Label(
+            top,
+            text=f"Новые возможности версии {ver}",
+            font=("Helvetica", 13, "bold"),
+        ).pack(padx=12, pady=(12, 4), anchor="w")
+        frame = tk.Frame(top)
+        frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=4)
+        txt = tk.Text(frame, width=72, height=16, wrap=tk.WORD)
+        vs = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=txt.yview)
+        txt.configure(yscrollcommand=vs.set)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vs.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.insert("1.0", text)
+        txt.configure(state=tk.DISABLED)
+
+        def close():
+            self.last_seen_version = ver
+            try:
+                self._persist_settings()
+            except Exception:
+                pass
+            top.destroy()
+
+        bf = tk.Frame(top)
+        bf.pack(pady=10)
+        _btn(bf, "Понятно", close, side=tk.LEFT, padx=4)
+        top.protocol("WM_DELETE_WINDOW", close)
+        if force:
+            top.lift()
+            top.focus_force()
+
+    def _maybe_show_whats_new(self):
+        """После обновления — показать «Что нового» один раз при старте."""
+        current = (self.app_version or read_local_version(APP_DIR)).strip()
+        last = (self.last_seen_version or "").strip()
+        if not last:
+            # первый запуск / нет метки — запомнить, не беспокоить
+            self.last_seen_version = current
+            try:
+                self._persist_settings()
+            except Exception:
+                pass
+            return
+        if last == current:
+            return
+        self.show_whats_new(version=current, previous_version=last, force=True)
 
     def _mark_update_checked(self):
         self.last_update_check = datetime.now().strftime("%Y-%m-%d")
@@ -2002,10 +2518,14 @@ class DesktopApp:
             self.last_emk_dir = str(s["last_emk_dir"])
         if s.get("last_update_check"):
             self.last_update_check = str(s["last_update_check"])
+        if s.get("last_seen_version"):
+            self.last_seen_version = str(s["last_seen_version"])
         if isinstance(s.get("summary_paths_by_dept"), dict):
             self.summary_paths_by_dept = {
                 str(k): str(v) for k, v in s["summary_paths_by_dept"].items() if v
             }
+        if s.get("theme") in UI_THEMES:
+            self.theme_var.set(str(s["theme"]))
 
     def _persist_settings(self):
         # актуальный путь для текущего отделения
@@ -2026,7 +2546,9 @@ class DesktopApp:
                 "last_surg_dir": self.last_surg_dir,
                 "last_emk_dir": self.last_emk_dir,
                 "last_update_check": self.last_update_check,
+                "last_seen_version": self.last_seen_version,
                 "summary_paths_by_dept": self.summary_paths_by_dept,
+                "theme": self.theme_var.get() if self.theme_var.get() in UI_THEMES else "light",
             },
         )
 
@@ -2121,6 +2643,571 @@ class DesktopApp:
             )
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
+
+    def _selected_unclassified_defaults(self) -> dict:
+        """Подсказки из выделенной строки вкладки «Не классифицировано»."""
+        out = {"code": "", "service": "", "name": ""}
+        if not hasattr(self, "tree_uncl"):
+            return out
+        sel = self.tree_uncl.selection()
+        if not sel:
+            return out
+        vals = self.tree_uncl.item(sel[0], "values") or ()
+        # Дата, КВС, Код, Название КСГ, КСГ, Услуга
+        if len(vals) >= 3:
+            out["code"] = str(vals[2] or "").strip()
+        if len(vals) >= 4 and vals[3]:
+            out["name"] = str(vals[3]).strip()
+        if len(vals) >= 6:
+            out["service"] = str(vals[5] or "").strip()
+        if not out["name"] and out["service"]:
+            out["name"] = out["service"][:60]
+        return out
+
+    def _selected_dispute_defaults(self) -> dict:
+        out = {"category": "", "candidates": [], "store_index": None}
+        if not hasattr(self, "tree_dispute"):
+            return out
+        sel = self.tree_dispute.selection()
+        if not sel:
+            return out
+        iid = sel[0]
+        try:
+            out["store_index"] = int(iid)
+        except (TypeError, ValueError):
+            out["store_index"] = iid
+        vals = self.tree_dispute.item(sel[0], "values") or ()
+        # Дата, КВС, Код, Услуга, Категория, Кандидаты
+        if len(vals) >= 5:
+            out["category"] = str(vals[4] or "").strip()
+        if len(vals) >= 6 and vals[5]:
+            out["candidates"] = [c.strip() for c in str(vals[5]).split("|") if c.strip()]
+        return out
+
+    def assign_disputed_category_dialog(self):
+        """Назначить категорию выбранной спорной операции вручную."""
+        if self.store.ops.empty:
+            messagebox.showinfo("Спорные", "Нет данных — загрузите опержурнал")
+            return
+        defaults = self._selected_dispute_defaults()
+        if defaults["store_index"] is None:
+            messagebox.showinfo("Спорные", "Выберите строку в таблице")
+            return
+        idx = defaults["store_index"]
+        if idx not in self.store.ops.index:
+            messagebox.showwarning("Спорные", "Строка не найдена в накопителе — обновите отчёт")
+            return
+
+        rows = list((self.summary_cfg.get("category_rows") or {}).keys())
+        # кандидаты сверху
+        ordered = []
+        for c in defaults["candidates"]:
+            if c and c not in ordered:
+                ordered.append(c)
+        for c in rows:
+            if c not in ordered:
+                ordered.append(c)
+        if defaults["category"] and defaults["category"] not in ordered:
+            ordered.insert(0, defaults["category"])
+
+        top = tk.Toplevel(self.root)
+        top.title("Назначить категорию")
+        top.transient(self.root)
+        cat_var = StringVar(value=defaults["candidates"][0] if defaults["candidates"] else (defaults["category"] or (ordered[0] if ordered else "")))
+        tk.Label(top, text="Категория для выбранной операции:").pack(anchor="w", padx=10, pady=(10, 2))
+        ttk.Combobox(top, textvariable=cat_var, values=ordered, width=48, state="readonly").pack(
+            fill=tk.X, padx=10, pady=4
+        )
+        tk.Label(
+            top,
+            text="Назначение сохранится как ручное и не сбросится при правке ключей.",
+            fg="#555",
+            wraplength=420,
+            justify=tk.LEFT,
+        ).pack(anchor="w", padx=10, pady=4)
+
+        def apply():
+            name = cat_var.get().strip()
+            if not name:
+                messagebox.showwarning("Категория", "Выберите категорию", parent=top)
+                return
+            meta = lookup_category_meta(self.config.get("surgery_categories") or [], name)
+            ops = self.store.ops
+            if "Ручная_категория" not in ops.columns:
+                ops["Ручная_категория"] = False
+            if "Спор_ключей" not in ops.columns:
+                ops["Спор_ключей"] = False
+            if "Спорные_категории" not in ops.columns:
+                ops["Спорные_категории"] = ""
+            ops.at[idx, "Категория"] = name
+            ops.at[idx, "Спор_ключей"] = False
+            ops.at[idx, "Спорные_категории"] = ""
+            ops.at[idx, "Ручная_категория"] = True
+            if meta:
+                ops.at[idx, "Группа"] = meta.get("group", ops.at[idx, "Группа"] if "Группа" in ops.columns else "")
+                ops.at[idx, "Строка_4001"] = meta.get("line", "")
+                ops.at[idx, "Гистология"] = bool(meta.get("histology", False))
+            self.log_message(f"Спорные: строка {idx} → «{name}» (вручную)")
+            top.destroy()
+            self.run_analysis()
+
+        bf = tk.Frame(top)
+        bf.pack(pady=10)
+        _btn(bf, "Назначить", apply, side=tk.LEFT, padx=4)
+        _btn(bf, "Отмена", top.destroy, side=tk.LEFT, padx=4)
+
+    def edit_keywords_dialog_from_dispute(self):
+        defaults = self._selected_dispute_defaults()
+        prefer = ""
+        if defaults["candidates"]:
+            prefer = defaults["candidates"][0]
+        elif defaults["category"]:
+            prefer = defaults["category"]
+        self.edit_keywords_dialog(preselect=prefer)
+
+    def edit_keywords_dialog(self, preselect: str = ""):
+        """Правка name_keywords у существующей категории + переклассификация."""
+        cats = self.config.get("surgery_categories") or []
+        names = [str(c.get("category") or "").strip() for c in cats if c.get("category")]
+        if not names:
+            messagebox.showinfo("Ключи", "В config нет категорий")
+            return
+
+        top = tk.Toplevel(self.root)
+        top.title("Ключевые слова категории")
+        top.transient(self.root)
+        top.resizable(True, True)
+        pad = {"padx": 10, "pady": 3}
+
+        name_var = StringVar(value=preselect if preselect in names else names[0])
+        kw_var = StringVar()
+
+        def load_kw(*_a):
+            meta = lookup_category_meta(cats, name_var.get())
+            kws = (meta or {}).get("name_keywords") or []
+            kw_var.set(", ".join(str(x) for x in kws))
+
+        tk.Label(top, text="Категория:").pack(anchor="w", **pad)
+        cb = ttk.Combobox(top, textvariable=name_var, values=names, width=48, state="readonly")
+        cb.pack(fill=tk.X, **pad)
+        cb.bind("<<ComboboxSelected>>", load_kw)
+        tk.Label(top, text="Ключевые слова (через запятую):").pack(anchor="w", **pad)
+        tk.Entry(top, textvariable=kw_var, width=56).pack(fill=tk.X, **pad)
+        tk.Label(
+            top,
+            text=(
+                "Каждый ключ после запятой — отдельно («или»). "
+                "Словосочетание целиком — одним ключом без запятой. "
+                "После сохранения спорные/неклассифицированные строки без ручной метки пересчитаются."
+            ),
+            fg="#555",
+            wraplength=520,
+            justify=tk.LEFT,
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+        load_kw()
+
+        def save():
+            try:
+                kws = [c.strip() for c in kw_var.get().replace(";", ",").split(",") if c.strip()]
+                cfg, normed = update_category_keywords_file(
+                    APP_DIR / "config.yaml",
+                    name_var.get(),
+                    kws,
+                    config=self.config,
+                )
+                self.config = cfg
+                self.summary_cfg = self.config.get("summary", {})
+                if not self.store.ops.empty:
+                    self.store.ops = reclassify_ops_by_keywords(
+                        self.store.ops, self.config.get("surgery_categories") or []
+                    )
+                self.log_message(
+                    f"Ключи «{name_var.get()}»: {normed or '—'}; переклассификация накопителя"
+                )
+                top.destroy()
+                if not self.store.ops.empty:
+                    self.run_analysis()
+                else:
+                    messagebox.showinfo("Ключи", f"Сохранено: {', '.join(normed) or 'пусто'}")
+            except CategoryRegistryError as e:
+                messagebox.showwarning("Проверка", str(e), parent=top)
+            except Exception as e:
+                self.log_message(traceback.format_exc(), level="ERROR")
+                messagebox.showerror("Ошибка", str(e), parent=top)
+
+        bf = tk.Frame(top)
+        bf.pack(pady=10)
+        _btn(bf, "Сохранить", save, side=tk.LEFT, padx=4)
+        _btn(bf, "Отмена", top.destroy, side=tk.LEFT, padx=4)
+
+    def add_category_dialog(self):
+        """Мастер: добавить неизвестную операцию в config (± Excel)."""
+        defaults = self._selected_unclassified_defaults()
+        cat = get_catalog()
+        hint = cat.hint_for(defaults["code"]) if defaults["code"] else ""
+        if defaults["code"] and not defaults["name"]:
+            info = cat.lookup(defaults["code"])
+            if info and info.get("name"):
+                defaults["name"] = str(info["name"])[:60]
+
+        top = tk.Toplevel(self.root)
+        top.title("Добавить операцию в отчёт")
+        top.transient(self.root)
+        top.resizable(True, True)
+
+        name_var = StringVar(value=defaults.get("name") or "")
+        codes_var = StringVar(value=defaults.get("code") or "")
+        kw_var = StringVar(value=", ".join(suggest_keywords_from_name(name_var.get())))
+        kind_var = StringVar(value="plan")
+        line_var = StringVar(value="6")
+        hist_var = BooleanVar(value=False)
+        endo_var = BooleanVar(value=False)
+        anchor_var = StringVar(value=default_anchor_category(self.config))
+        ksg_query = StringVar(value=defaults.get("code") or defaults.get("name") or "")
+        ksg_hint = StringVar(value=hint or "Поиск по KSGoperacii.csv или заполните поля вручную")
+
+        pad = {"padx": 10, "pady": 3}
+
+        tk.Label(top, text="Название в отчёте (как в сводной):").pack(anchor="w", **pad)
+        tk.Entry(top, textvariable=name_var, width=56).pack(fill=tk.X, **pad)
+
+        tk.Label(top, text="Код(ы) через запятую:").pack(anchor="w", **pad)
+        tk.Entry(top, textvariable=codes_var, width=56).pack(fill=tk.X, **pad)
+
+        tk.Label(top, text="Ключевые слова (через запятую):").pack(anchor="w", **pad)
+        tk.Entry(top, textvariable=kw_var, width=56).pack(fill=tk.X, **pad)
+        tk.Label(
+            top,
+            text=(
+                "Как ищутся: каждый ключ после запятой проверяется отдельно как подстрока в названии услуги "
+                "(без учёта регистра). Достаточно совпадения хотя бы одного ключа («или», не «и»). "
+                "Несколько совпадений усиливают выбор этой категории. "
+                "Словосочетание целиком — пишите одним ключом без запятой "
+                "(например: «резекция гортани»)."
+            ),
+            fg="#555",
+            wraplength=520,
+            justify=tk.LEFT,
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+
+        row_kind = tk.Frame(top)
+        row_kind.pack(fill=tk.X, **pad)
+        tk.Label(row_kind, text="Тип:").pack(side=tk.LEFT)
+        tk.Radiobutton(row_kind, text="Плановая", variable=kind_var, value="plan").pack(side=tk.LEFT, padx=6)
+        tk.Radiobutton(row_kind, text="Экстренная", variable=kind_var, value="emergency").pack(side=tk.LEFT)
+
+        row_line = tk.Frame(top)
+        row_line.pack(fill=tk.X, **pad)
+        tk.Label(row_line, text="Строка формы 4001:").pack(side=tk.LEFT)
+        ttk.Combobox(
+            row_line,
+            textvariable=line_var,
+            values=["5.1", "5.2", "6", "6.1", "17"],
+            width=8,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=6)
+        tk.Checkbutton(row_line, text="Гистология", variable=hist_var).pack(side=tk.LEFT, padx=8)
+        tk.Checkbutton(row_line, text="Эндоскопия", variable=endo_var).pack(side=tk.LEFT)
+
+        row_anchor = tk.Frame(top)
+        row_anchor.pack(fill=tk.X, **pad)
+        tk.Label(row_anchor, text="Вставить после:").pack(side=tk.LEFT)
+        anchors = list((self.summary_cfg.get("category_rows") or {}).keys())
+        ttk.Combobox(row_anchor, textvariable=anchor_var, values=anchors, width=40, state="readonly").pack(
+            side=tk.LEFT, padx=6
+        )
+
+        ksg_fr = tk.LabelFrame(top, text="Рубрикатор КСГ", padx=6, pady=4)
+        ksg_fr.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        qrow = tk.Frame(ksg_fr)
+        qrow.pack(fill=tk.X)
+        ksg_entry = tk.Entry(qrow, textvariable=ksg_query, width=40)
+        ksg_entry.pack(side=tk.LEFT, padx=(0, 4))
+        ksg_list = tk.Listbox(ksg_fr, height=6)
+
+        def do_search(_event=None):
+            ksg_list.delete(0, tk.END)
+            hits = cat.search(ksg_query.get(), limit=40)
+            if not hits:
+                ksg_hint.set("Ничего не найдено — заполните поля вручную")
+                return
+            ksg_hint.set(f"Найдено: {len(hits)}. Выберите строку (Enter / двойной клик) — подставить")
+            for h in hits:
+                ksg_list.insert(tk.END, f"{h['code']} | {h['name']}")
+
+        def apply_hit(_event=None):
+            sel = ksg_list.curselection()
+            if not sel:
+                return
+            text = ksg_list.get(sel[0])
+            code = text.split("|", 1)[0].strip()
+            info = cat.lookup(code)
+            if not info:
+                return
+            codes_var.set(code)
+            # всегда обновляем название при выборе из рубрикатора
+            name_var.set(str(info.get("name") or "")[:60])
+            kw_var.set(", ".join(suggest_keywords_from_name(info.get("name") or name_var.get())))
+            ksg_hint.set(cat.hint_for(code))
+
+        _btn(qrow, "Поиск", do_search, side=tk.LEFT, padx=2)
+        ksg_entry.bind("<Return>", do_search)
+        ksg_list.pack(fill=tk.BOTH, expand=True, pady=4)
+        ksg_list.bind("<Double-Button-1>", apply_hit)
+        ksg_list.bind("<Return>", apply_hit)
+        tk.Label(ksg_fr, textvariable=ksg_hint, fg="#555", wraplength=520, justify=tk.LEFT).pack(anchor="w")
+        # автопоиск при открытии не запускаем — только по кнопке / Enter
+
+        def build_spec() -> CategorySpec:
+            codes = [c.strip() for c in codes_var.get().replace(";", ",").split(",") if c.strip()]
+            kws = [c.strip() for c in kw_var.get().replace(";", ",").split(",") if c.strip()]
+            return CategorySpec(
+                name=name_var.get().strip(),
+                codes=codes,
+                name_keywords=kws,
+                kind=kind_var.get(),
+                form_line=line_var.get(),
+                histology=bool(hist_var.get()),
+                endoscopic=bool(endo_var.get()),
+                anchor_category=anchor_var.get(),
+            )
+
+        def reload_after():
+            cfg = self.load_config()
+            if cfg is None:
+                return
+            self.config = cfg
+            self.summary_cfg = self.config.get("summary", {})
+            if not self.store.ops.empty:
+                self.run_analysis()
+
+        def do_config_only():
+            try:
+                _cfg, result = register_category(APP_DIR / "config.yaml", build_spec(), config=self.config)
+                self.config = _cfg
+                self.summary_cfg = self.config.get("summary", {})
+                msg = f"В программе: «{result.name}» → строка Excel {result.excel_row}"
+                if result.warnings:
+                    msg += "\n" + "\n".join(result.warnings)
+                self.log_message(msg)
+                reload_after()
+                messagebox.showinfo(
+                    "Готово",
+                    msg + "\n\nДобавьте строку в Excel или нажмите «В программе + Excel».",
+                    parent=top,
+                )
+                top.destroy()
+            except CategoryRegistryError as e:
+                messagebox.showwarning("Проверка", str(e), parent=top)
+            except Exception as e:
+                self.log_message(traceback.format_exc(), level="ERROR")
+                messagebox.showerror("Ошибка", str(e), parent=top)
+
+        def do_config_and_excel():
+            path = self.summary_path.get().strip()
+            if not path or not os.path.exists(path):
+                messagebox.showerror("Сводная", f"Файл сводной не найден:\n{path}", parent=top)
+                return
+            if excel_file_locked(path):
+                messagebox.showerror("Файл занят", "Закройте сводную в Excel и повторите.", parent=top)
+                return
+            try:
+                spec = build_spec()
+                _cfg, result = register_category(APP_DIR / "config.yaml", spec, config=self.config)
+                self.config = _cfg
+                self.summary_cfg = self.config.get("summary", {})
+                sheets = {
+                    int(k): v for k, v in (self.summary_cfg.get("sheet_names") or {}).items()
+                }
+                anchor_row = find_anchor_row(self.summary_cfg.get("category_rows") or {}, spec.anchor_category)
+                xrep = add_category_row_to_summary(
+                    path,
+                    category_name=result.name,
+                    excel_row=result.excel_row,
+                    form_line=spec.form_line,
+                    sheet_names=sheets,
+                    form_cfg=self.summary_cfg.get("form_4001") or {},
+                    kind=spec.kind,
+                    histology=bool(spec.histology),
+                    endoscopic=bool(spec.endoscopic),
+                    anchor_row=anchor_row,
+                    backup=True,
+                    backup_keep=int(self.summary_cfg.get("backup_keep", 20)),
+                )
+                blank_delta = int(xrep.get("blank_delta") or 0)
+                if blank_delta:
+                    shift_totals_rows_by_delta(self.config, blank_delta)
+                    save_config(self.config, APP_DIR / "config.yaml")
+                    self.summary_cfg = self.config.get("summary", {})
+                msg = (
+                    f"«{result.name}» → вставлена строка {result.excel_row} "
+                    f"({ 'экстр.' if spec.kind == 'emergency' else 'план' })\n"
+                    f"Месяцы: {len(xrep.get('sheets') or [])}, "
+                    f"сводные: {', '.join(xrep.get('overview') or []) or '—'}\n"
+                    f"Формулы 4001: N+{xrep['formulas']['n']}, R+{xrep['formulas']['r']}; "
+                    f"итоги+{xrep['formulas']['total']}, план/экстр+{xrep['formulas']['kind']}; "
+                    f"графики+{xrep.get('charts', 0)}"
+                )
+                if xrep.get("backup"):
+                    msg += f"\nБэкап: {xrep['backup']}"
+                self.log_message(msg)
+                reload_after()
+                messagebox.showinfo(
+                    "Готово",
+                    msg + "\n\nДальше: «Обновить превью» и при необходимости «Записать в Excel…».",
+                    parent=top,
+                )
+                top.destroy()
+            except CategoryRegistryError as e:
+                messagebox.showwarning("Проверка", str(e), parent=top)
+            except Exception as e:
+                self.log_message(traceback.format_exc(), level="ERROR")
+                messagebox.showerror("Ошибка", str(e), parent=top)
+
+        bf = tk.Frame(top)
+        bf.pack(pady=10)
+        _btn(bf, "Только в программе", do_config_only, side=tk.LEFT, padx=4)
+        _btn(bf, "В программе + Excel", do_config_and_excel, side=tk.LEFT, padx=4)
+        _btn(bf, "Отмена", top.destroy, side=tk.LEFT, padx=4)
+
+    def delete_category_dialog(self):
+        """Удалить категорию операции из программы и (опционально) из Excel."""
+        rows = dict(self.summary_cfg.get("category_rows") or {})
+        if not rows:
+            messagebox.showinfo("Удаление", "В config нет категорий")
+            return
+        # сортировка по номеру строки
+        names = [k for k, _ in sorted(rows.items(), key=lambda kv: int(kv[1]))]
+
+        top = tk.Toplevel(self.root)
+        top.title("Удалить операцию из отчёта")
+        top.transient(self.root)
+        top.resizable(True, True)
+        tk.Label(
+            top,
+            text="Выберите операцию. Удалится из программы; при выборе «В программе + Excel» — "
+            "и строка из сводной на всех листах.",
+            wraplength=520,
+            justify=tk.LEFT,
+        ).pack(padx=12, pady=8, anchor="w")
+
+        name_var = StringVar(value=names[-1] if names else "")
+        ttk.Combobox(top, textvariable=name_var, values=names, width=48, state="readonly").pack(
+            padx=12, pady=4, anchor="w"
+        )
+        row_info = StringVar(value="")
+
+        def refresh_info(*_a):
+            n = name_var.get()
+            r = rows.get(n)
+            row_info.set(f"Строка Excel: {r}" if r is not None else "")
+
+        name_var.trace_add("write", refresh_info)
+        refresh_info()
+        tk.Label(top, textvariable=row_info, fg="#555").pack(padx=12, anchor="w")
+
+        def reload_after():
+            cfg = self.load_config()
+            if cfg is None:
+                return
+            self.config = cfg
+            self.summary_cfg = self.config.get("summary", {})
+            if not self.store.ops.empty:
+                self.run_analysis()
+
+        def do_program_only():
+            name = name_var.get()
+            if not name:
+                return
+            if not messagebox.askyesno(
+                "Удаление",
+                f"Удалить «{name}» из программы (config)?\nСтрока в Excel не трогается.",
+                parent=top,
+            ):
+                return
+            try:
+                _cfg, result = unregister_category(
+                    APP_DIR / "config.yaml", name, config=self.config
+                )
+                self.config = _cfg
+                self.summary_cfg = self.config.get("summary", {})
+                self.log_message(
+                    f"Удалено из программы: «{result.name}» (была строка {result.excel_row})"
+                )
+                reload_after()
+                messagebox.showinfo("Готово", f"Удалено: «{result.name}»", parent=top)
+                top.destroy()
+            except CategoryRegistryError as e:
+                messagebox.showwarning("Проверка", str(e), parent=top)
+            except Exception as e:
+                self.log_message(traceback.format_exc(), level="ERROR")
+                messagebox.showerror("Ошибка", str(e), parent=top)
+
+        def do_program_and_excel():
+            name = name_var.get()
+            if not name:
+                return
+            path = self.summary_path.get().strip()
+            if not path or not os.path.exists(path):
+                messagebox.showerror("Сводная", f"Файл сводной не найден:\n{path}", parent=top)
+                return
+            if excel_file_locked(path):
+                messagebox.showerror("Файл занят", "Закройте сводную в Excel и повторите.", parent=top)
+                return
+            excel_row = int(rows.get(name) or 0)
+            if not excel_row:
+                messagebox.showwarning("Удаление", "Неизвестна строка Excel", parent=top)
+                return
+            if not messagebox.askyesno(
+                "Удаление",
+                f"Удалить «{name}» из программы и строку {excel_row} из Excel "
+                f"(все месяцы, ОБЩАЯ, графики)?",
+                parent=top,
+            ):
+                return
+            try:
+                _cfg, result = unregister_category(
+                    APP_DIR / "config.yaml", name, config=self.config
+                )
+                self.config = _cfg
+                self.summary_cfg = self.config.get("summary", {})
+                sheets = {
+                    int(k): v for k, v in (self.summary_cfg.get("sheet_names") or {}).items()
+                }
+                xrep = delete_category_row_from_summary(
+                    path,
+                    excel_row=result.excel_row,
+                    sheet_names=sheets,
+                    backup=True,
+                    backup_keep=int(self.summary_cfg.get("backup_keep", 20)),
+                )
+                blank_delta = int(xrep.get("blank_delta") or 0)
+                if blank_delta:
+                    shift_totals_rows_by_delta(self.config, blank_delta)
+                    save_config(self.config, APP_DIR / "config.yaml")
+                    self.summary_cfg = self.config.get("summary", {})
+                msg = (
+                    f"Удалено «{result.name}» (строка {result.excel_row})\n"
+                    f"Листов: {len(xrep.get('sheets') or [])}, "
+                    f"сводные: {', '.join(xrep.get('overview') or []) or '—'}"
+                )
+                if xrep.get("backup"):
+                    msg += f"\nБэкап: {xrep['backup']}"
+                self.log_message(msg)
+                reload_after()
+                messagebox.showinfo("Готово", msg, parent=top)
+                top.destroy()
+            except CategoryRegistryError as e:
+                messagebox.showwarning("Проверка", str(e), parent=top)
+            except Exception as e:
+                self.log_message(traceback.format_exc(), level="ERROR")
+                messagebox.showerror("Ошибка", str(e), parent=top)
+
+        bf = tk.Frame(top)
+        bf.pack(pady=10)
+        _btn(bf, "Только в программе", do_program_only, side=tk.LEFT, padx=4)
+        _btn(bf, "В программе + Excel", do_program_and_excel, side=tk.LEFT, padx=4)
+        _btn(bf, "Отмена", top.destroy, side=tk.LEFT, padx=4)
 
     def export_emk_mismatches(self):
         result = self.last_emk_compare

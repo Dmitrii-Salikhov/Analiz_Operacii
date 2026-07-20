@@ -62,6 +62,21 @@ class KsgCatalog:
             parts.append("КСГ: " + ", ".join(info["ksg"]))
         return " | ".join(parts) if parts else code
 
+    def search(self, query: str, limit: int = 25) -> List[dict]:
+        """Поиск по коду или фрагменту названия услуги."""
+        q = str(query or "").strip().lower()
+        if not q:
+            return []
+        hits: List[dict] = []
+        for info in self.by_code.values():
+            code = str(info.get("code") or "").lower()
+            name = str(info.get("name") or "").lower()
+            if q in code or q in name:
+                hits.append(info)
+                if len(hits) >= limit:
+                    break
+        return hits
+
     def suggest_config_line(self, code: str) -> str:
         return self.suggest_config_snippet(code)
 
