@@ -13,6 +13,65 @@ from analyzers.ksg_catalog import get_catalog
 ADENOTOMY_CODES_DEFAULT = {"A16.08.002.001"}
 
 
+def resolve_emk_hosp_type(episodes: List[dict], date_op) -> Optional[str]:
+    """
+    Тип госпитализации из ЭМК для операции:
+    1) дата в интервале [поступление, выписка];
+    2) ±1 день к поступлению (расхождение журнала и ЭМК);
+    3) единственный эпизод по КВС;
+    4) ближайший эпизод (до 3 суток).
+    """
+    if not episodes or pd.isna(date_op):
+        return None
+    date_op = pd.Timestamp(date_op).normalize()
+
+    def in_window(ep: dict, *, grace_days: int = 0) -> bool:
+        adm = pd.Timestamp(ep["admission"]).normalize() - pd.Timedelta(days=grace_days)
+        disc = pd.Timestamp(ep["discharge"]).normalize()
+        return adm <= date_op <= disc
+
+    for ep in episodes:
+        if in_window(ep):
+            return ep.get("type") or None
+    for ep in episodes:
+        if in_window(ep, grace_days=1):
+            return ep.get("type") or None
+    if len(episodes) == 1:
+        return episodes[0].get("type") or None
+
+    best_type = None
+    best_dist = None
+    for ep in episodes:
+        adm = pd.Timestamp(ep["admission"]).normalize()
+        disc = pd.Timestamp(ep["discharge"]).normalize()
+        if date_op < adm:
+            dist = int((adm - date_op).days)
+        elif date_op > disc:
+            dist = int((date_op - disc).days)
+        else:
+            dist = 0
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_type = ep.get("type") or None
+    if best_dist is not None and best_dist <= 3:
+        return best_type
+    return None
+
+
+def resolve_emk_diagnosis(episodes: List[dict], date_op) -> str:
+    if not episodes or pd.isna(date_op):
+        return ""
+    date_op = pd.Timestamp(date_op).normalize()
+    for ep in episodes:
+        adm = pd.Timestamp(ep["admission"]).normalize()
+        disc = pd.Timestamp(ep["discharge"]).normalize()
+        if adm <= date_op <= disc:
+            return str(ep.get("diagnosis") or "")
+    if len(episodes) == 1:
+        return str(episodes[0].get("diagnosis") or "")
+    return ""
+
+
 def has_adenotomy(
     companion_codes=None,
     service_text: str = "",
@@ -233,21 +292,11 @@ class SurgeryAnalyzer:
 
     def hosp_type_for(self, kvs, date_op) -> Optional[str]:
         episodes = self._emk_hosp_index.get(str(kvs).strip(), [])
-        if not episodes or pd.isna(date_op):
-            return None
-        for ep in episodes:
-            if ep["admission"] <= date_op <= ep["discharge"]:
-                return ep["type"]
-        return None
+        return resolve_emk_hosp_type(episodes, date_op)
 
     def diagnosis_for(self, kvs, date_op) -> str:
         episodes = self._emk_hosp_index.get(str(kvs).strip(), [])
-        if not episodes or pd.isna(date_op):
-            return ""
-        for ep in episodes:
-            if ep["admission"] <= date_op <= ep["discharge"]:
-                return ep.get("diagnosis", "")
-        return ""
+        return resolve_emk_diagnosis(episodes, date_op)
 
     def extract_operations(self) -> pd.DataFrame:
         ops = []

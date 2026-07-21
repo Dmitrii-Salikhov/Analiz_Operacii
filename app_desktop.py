@@ -23,6 +23,13 @@ from tkinter import BooleanVar, Menu, StringVar, filedialog, messagebox, ttk
 
 from analyzers.app_log import AppLog
 from analyzers.emk_compare import compare_plan_emergency, format_mismatch_report
+from analyzers.emk_kind_classify import (
+    apply_kind_to_summary_cfg,
+    classify_categories_by_emk,
+    disputed_to_dataframe,
+    format_kind_report,
+)
+from analyzers.emk_loader import emk_department_stats, read_emk_stationary_report
 from analyzers.export_report import export_month_like_summary
 from analyzers.file_lock import excel_file_locked
 from analyzers.form_4001 import compute_form_4001, form_4001_preview_rows
@@ -38,6 +45,23 @@ from analyzers.category_registry import (
     unregister_category,
     update_category_keywords_file,
 )
+from analyzers.dept_config import (
+    DEPT_REPORT_SOURCES,
+    default_summary_filename,
+    dept_summary_key,
+    ensure_multi_dept_config,
+    form_4001_enabled,
+    get_summary_cfg,
+    get_surgery_categories,
+    is_lor_department,
+    set_summary_cfg,
+)
+from analyzers.dept_inventory import (
+    build_inventory_table,
+    export_inventory_excel,
+    inventory_from_source,
+)
+from analyzers.dept_template import create_from_summary_cfg
 from analyzers.summary_layout import (
     add_category_row_to_summary,
     delete_category_row_from_summary,
@@ -168,7 +192,9 @@ class DesktopApp:
             root.destroy()
             return
 
-        self.summary_cfg = self.config.get("summary", {})
+        ensure_multi_dept_config(self.config)
+        self.summary_key = "lor"
+        self.summary_cfg = get_summary_cfg(self.config, summary_key="lor")
         self.df_emk = None
         self.emk_path = None
         self.store = OperationsStore()
@@ -211,6 +237,7 @@ class DesktopApp:
 
         self._apply_saved_settings()
         self._prev_dept = self.dept_var.get()
+        self._sync_dept_context()
 
         self.kpi_ops_var = StringVar(value="—")
         self.kpi_patients_var = StringVar(value="—")
@@ -235,11 +262,25 @@ class DesktopApp:
     def load_config(self):
         try:
             with open(APP_DIR / "config.yaml", "r", encoding="utf-8") as f:
-                return yaml.safe_load(f)
+                cfg = yaml.safe_load(f)
+            ensure_multi_dept_config(cfg)
+            return cfg
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить config.yaml:\n{e}")
             logging.critical(f"Config load error: {e}")
             return None
+
+    def _surgery_categories(self) -> list:
+        return get_surgery_categories(self.config, summary_key=self.summary_key)
+
+    def _sync_dept_context(self):
+        """Активное отделение → summary_key и summary_cfg."""
+        ensure_multi_dept_config(self.config)
+        self.summary_key = dept_summary_key(self.config, self.dept_var.get())
+        self.summary_cfg = get_summary_cfg(self.config, summary_key=self.summary_key)
+        if not form_4001_enabled(self.summary_cfg):
+            self.write_form_var.set(False)
+        self._refresh_dept_hint()
 
     def _build_menu(self):
         bar = Menu(self.root)
@@ -257,6 +298,13 @@ class DesktopApp:
         file_m.add_command(label="Создать сводную на год…", command=self.create_year_summary_dialog)
         file_m.add_command(label="Экспорт неклассифицированных…", command=self.export_unclassified)
         file_m.add_command(label="Экспорт проблемных кодов…", command=self.export_problem_codes)
+        file_m.add_separator()
+        file_m.add_command(label="Инвентаризация отделения…", command=self.inventory_department_dialog)
+        file_m.add_command(label="Создать сводную для отделения…", command=self.create_dept_summary_dialog)
+        file_m.add_command(
+            label="План/экстр по ЭМК…", command=self.classify_kinds_from_emk_dialog
+        )
+        file_m.add_separator()
         file_m.add_command(label="Добавить операцию в отчёт…", command=self.add_category_dialog)
         file_m.add_command(label="Удалить операцию из отчёта…", command=self.delete_category_dialog)
         file_m.add_separator()
@@ -1178,7 +1226,9 @@ class DesktopApp:
             self.notebook.select(self.tab_log)
 
     def _on_plan_mode_change(self):
-        if not self.store.ops.empty:
+        if self.plan_mode.get() == "emk":
+            self.on_emk_mode()
+        elif not self.store.ops.empty:
             self.run_analysis()
 
     def _weeks_for_month(self, year: int, month: int):
@@ -1247,8 +1297,8 @@ class DesktopApp:
     def load_emk(self):
         path = filedialog.askopenfilename(
             initialdir=self.last_emk_dir,
-            filetypes=[("Excel/CSV", "*.xlsx *.csv")],
-            title="ЭМК",
+            filetypes=[("Excel/CSV", "*.xlsx *.xls *.csv"), ("Excel", "*.xlsx *.xls"), ("CSV", "*.csv")],
+            title="ЭМК — отчёт по заполнению в стационаре",
         )
         if not path:
             return
@@ -1256,13 +1306,23 @@ class DesktopApp:
         self._persist_settings()
         try:
             self._busy(True)
-            self.df_emk = read_table(path)
+            if str(path).lower().endswith(".csv"):
+                self.df_emk = read_table(path)
+            else:
+                self.df_emk = read_emk_stationary_report(path)
             self.emk_path = path
             self._refresh_sources_list()
-            self.log_message(f"ЭМК: {path} ({len(self.df_emk)} строк)")
+            stats = emk_department_stats(self.df_emk)
+            dept = self.dept_var.get()
+            dept_rows = stats.get(dept)
+            if dept_rows is None:
+                # частичное совпадение по подстроке
+                dept_rows = sum(v for k, v in stats.items() if dept and dept in str(k))
+            extra = f", отделение «{dept}»: {dept_rows} стр." if dept_rows else ""
+            self.log_message(f"ЭМК: {path} ({len(self.df_emk)} строк{extra})")
             if not self.store.ops.empty:
                 n = self._rebind_emk_to_store()
-                self.log_message(f"Привязка ЭМК: {n} операций")
+                self.log_message(f"Привязка ЭМК: {n} операций с типом госпитализации")
                 self.run_analysis()
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
@@ -1277,7 +1337,7 @@ class DesktopApp:
 
         analyzer = SA.__new__(SA)
         analyzer.emk_df = self.df_emk
-        analyzer.categories = self.config["surgery_categories"]
+        analyzer.categories = self._surgery_categories()
         analyzer._code_index = analyzer._build_code_index()
         analyzer._emk_hosp_index = analyzer._build_emk_hosp_index()
         updated = 0
@@ -1359,7 +1419,7 @@ class DesktopApp:
                     df = read_table(path)
                     n_all = len(df)
                     analyzer = SurgeryAnalyzer(
-                        df, dept, self.config["surgery_categories"], emk_df=self.df_emk
+                        df, dept, self._surgery_categories(), emk_df=self.df_emk
                     )
                     n_dept = len(analyzer.df)
                     self.log_message(
@@ -1434,7 +1494,7 @@ class DesktopApp:
         try:
             self._busy(True)
             cat_table, totals_df, weeks = build_summary_tables(
-                ops, self.summary_cfg, self.config["surgery_categories"]
+                ops, self.summary_cfg, self._surgery_categories()
             )
             if self.plan_mode.get() == "emk" and self.df_emk is not None:
                 totals_df = self._totals_from_emk(ops, totals_df, weeks)
@@ -1523,7 +1583,7 @@ class DesktopApp:
         if ops["Тип_ЭМК"].astype(str).str.strip().eq("").all():
             self.kpi_diff_var.set("нет связи")
             return
-        result = compare_plan_emergency(ops, self.summary_cfg)
+        result = compare_plan_emergency(ops, self.summary_cfg, department=self.dept_var.get())
         self.kpi_diff_var.set(str(len(result["mismatches"])))
         self._fill_emk_tree(result, select_tab=False)
 
@@ -1560,11 +1620,18 @@ class DesktopApp:
                         str(m.get("Услуга") or "")[:100],
                     ),
                 )
+            linked = int(result.get("emk_linked") or 0)
+            total = int(result.get("total_ops") or 0)
             self.notebook.tab(self.tab_emk, text=f"Расхождения ЭМК ({n})")
             if n:
-                self.emk_info.set(f"Расхождений: {n} из {compared} сравнений")
+                self.emk_info.set(
+                    f"Расхождений: {n} из {compared} сравнений "
+                    f"(связано с ЭМК: {linked} из {total} операций)"
+                )
             else:
-                self.emk_info.set(f"Расхождений нет (сравнено {compared})")
+                self.emk_info.set(
+                    f"Расхождений нет (сравнено {compared}, связано {linked}/{total})"
+                )
         self.kpi_diff_var.set(str(n))
         if select_tab and hasattr(self, "tab_emk"):
             self.notebook.select(self.tab_emk)
@@ -1580,9 +1647,9 @@ class DesktopApp:
         if ops["Тип_ЭМК"].astype(str).str.strip().eq("").all():
             messagebox.showwarning("Нет связи", "КВС журнала и ЭМК не пересекаются")
             return
-        result = compare_plan_emergency(ops, self.summary_cfg)
+        result = compare_plan_emergency(ops, self.summary_cfg, department=self.dept_var.get())
         self._fill_emk_tree(result, select_tab=True)
-        self.log_message(format_mismatch_report(result))
+        self.log_message(format_mismatch_report(result, limit=30))
         if result["mismatches"]:
             messagebox.showwarning(
                 "Расхождения",
@@ -1713,7 +1780,7 @@ class DesktopApp:
         form_cfg = self.summary_cfg.get("form_4001") or {}
         stats = compute_form_4001(
             month_ops,
-            self.config.get("surgery_categories", []),
+            self._surgery_categories(),
             pension_age=int(self.config.get("thresholds", {}).get("pension_age", 60)),
             form_cfg=form_cfg,
         )
@@ -1868,13 +1935,19 @@ class DesktopApp:
         tk.Label(top, text=f"Год настроек: {cfg_year}", justify=tk.LEFT).pack(padx=12, pady=2, anchor="w")
 
         weeks_var = BooleanVar(value=self.write_weeks_var.get())
-        form_var = BooleanVar(value=self.write_form_var.get())
+        form_enabled = form_4001_enabled(self.summary_cfg)
+        form_var = BooleanVar(value=self.write_form_var.get() if form_enabled else False)
         tk.Checkbutton(top, text="Недели / категории (столбцы C–G)", variable=weeks_var).pack(
             padx=12, pady=4, anchor="w"
         )
-        tk.Checkbutton(top, text="Форма 4001 (формулы N/R не затираются)", variable=form_var).pack(
-            padx=12, pady=4, anchor="w"
-        )
+        if form_enabled:
+            tk.Checkbutton(top, text="Форма 4001 (формулы N/R не затираются)", variable=form_var).pack(
+                padx=12, pady=4, anchor="w"
+            )
+        else:
+            tk.Label(top, text="Форма 4001 для этого отделения не используется.", fg="#555").pack(
+                padx=12, pady=4, anchor="w"
+            )
         tk.Label(
             top,
             text="Закройте файл в Excel перед записью. Бэкап — в папку backups/ (до 20 шт.).",
@@ -1885,7 +1958,7 @@ class DesktopApp:
 
         def do_write():
             write_weeks = bool(weeks_var.get())
-            write_form = bool(form_var.get())
+            write_form = bool(form_var.get()) if form_enabled else False
             if not write_weeks and not write_form:
                 messagebox.showwarning("Запись", "Отметьте хотя бы один пункт", parent=top)
                 return
@@ -1924,7 +1997,7 @@ class DesktopApp:
                 path,
                 self.summary_cfg,
                 department=self.dept_var.get(),
-                categories=self.config.get("surgery_categories", []),
+                categories=self._surgery_categories(),
                 pension_age=int(self.config.get("thresholds", {}).get("pension_age", 60)),
             )
             report = writer.write(
@@ -1938,9 +2011,9 @@ class DesktopApp:
             )
             blank_delta = int(report.get("blank_delta") or 0)
             if blank_delta:
-                shift_totals_rows_by_delta(self.config, blank_delta)
+                shift_totals_rows_by_delta(self.config, blank_delta, summary_key=self.summary_key)
                 save_config(self.config, APP_DIR / "config.yaml")
-                self.summary_cfg = self.config.get("summary", {})
+                self._sync_dept_context()
                 self.log_message(
                     f"Разделитель перед итогами: сдвиг totals_rows на {blank_delta:+d}"
                 )
@@ -2089,7 +2162,7 @@ class DesktopApp:
                 self.get_view_ops(),
                 self.summary_cfg,
                 department=self.dept_var.get(),
-                categories=self.config.get("surgery_categories", []),
+                categories=self._surgery_categories(),
                 pension_age=int(self.config.get("thresholds", {}).get("pension_age", 60)),
                 month=month,
                 year=year,
@@ -2436,12 +2509,14 @@ class DesktopApp:
     def _refresh_dept_hint(self):
         if not hasattr(self, "dept_hint_var"):
             return
-        prof = self._dept_profile()
-        rub = str(prof.get("rubricator") or "lor")
-        if rub == "lor":
-            self.dept_hint_var.set("Рубрикатор: ЛОР")
+        key = dept_summary_key(self.config, self.dept_var.get())
+        n_cats = len(get_surgery_categories(self.config, summary_key=key))
+        if key == "lor":
+            self.dept_hint_var.set(f"Рубрикатор: ЛОР ({n_cats} операций)")
         else:
-            self.dept_hint_var.set("Фильтр журнала — да; рубрикатор пока общий (ЛОР)")
+            label = (DEPT_REPORT_SOURCES.get(key) or {}).get("label") or key
+            form = "форма 4001" if form_4001_enabled(get_summary_cfg(self.config, summary_key=key)) else "без 4001"
+            self.dept_hint_var.set(f"Рубрикатор: {label} ({n_cats} операций, {form})")
 
     def _on_department_changed(self):
         old = self._prev_dept
@@ -2451,6 +2526,15 @@ class DesktopApp:
             saved = self.summary_paths_by_dept.get(new)
             if saved:
                 self.summary_path.set(saved)
+            else:
+                try:
+                    y = int(self.year_var.get())
+                except (TypeError, ValueError):
+                    y = 2026
+                sk = dept_summary_key(self.config, new)
+                self.summary_path.set(
+                    str(APP_DIR / default_summary_filename(self.config, sk, y))
+                )
             if not self.store.ops.empty and self.loaded_department and self.loaded_department != new:
                 messagebox.showwarning(
                     "Отделение",
@@ -2459,7 +2543,9 @@ class DesktopApp:
                     "Очистите накопитель и загрузите журналы заново.",
                 )
         self._prev_dept = new
-        self._refresh_dept_hint()
+        self._sync_dept_context()
+        if not self.store.ops.empty:
+            self.run_analysis()
         self._persist_settings()
 
     def _restart_app(self):
@@ -2731,7 +2817,7 @@ class DesktopApp:
             if not name:
                 messagebox.showwarning("Категория", "Выберите категорию", parent=top)
                 return
-            meta = lookup_category_meta(self.config.get("surgery_categories") or [], name)
+            meta = lookup_category_meta(self._surgery_categories(), name)
             ops = self.store.ops
             if "Ручная_категория" not in ops.columns:
                 ops["Ручная_категория"] = False
@@ -2767,7 +2853,7 @@ class DesktopApp:
 
     def edit_keywords_dialog(self, preselect: str = ""):
         """Правка name_keywords у существующей категории + переклассификация."""
-        cats = self.config.get("surgery_categories") or []
+        cats = self._surgery_categories()
         names = [str(c.get("category") or "").strip() for c in cats if c.get("category")]
         if not names:
             messagebox.showinfo("Ключи", "В config нет категорий")
@@ -2814,12 +2900,13 @@ class DesktopApp:
                     name_var.get(),
                     kws,
                     config=self.config,
+                    summary_key=self.summary_key,
                 )
                 self.config = cfg
-                self.summary_cfg = self.config.get("summary", {})
+                self._sync_dept_context()
                 if not self.store.ops.empty:
                     self.store.ops = reclassify_ops_by_keywords(
-                        self.store.ops, self.config.get("surgery_categories") or []
+                        self.store.ops, self._surgery_categories()
                     )
                 self.log_message(
                     f"Ключи «{name_var.get()}»: {normed or '—'}; переклассификация накопителя"
@@ -2839,6 +2926,190 @@ class DesktopApp:
         bf.pack(pady=10)
         _btn(bf, "Сохранить", save, side=tk.LEFT, padx=4)
         _btn(bf, "Отмена", top.destroy, side=tk.LEFT, padx=4)
+
+    def inventory_department_dialog(self):
+        """Инвентаризация кодов операций из отчёта отделения."""
+        keys = [k for k in DEPT_REPORT_SOURCES if k in (self.config.get("summaries") or {})]
+        if not keys:
+            keys = list(DEPT_REPORT_SOURCES.keys())
+        labels = [
+            f"{DEPT_REPORT_SOURCES[k]['label']} ({DEPT_REPORT_SOURCES[k]['department']})" for k in keys
+        ]
+        top = tk.Toplevel(self.root)
+        top.title("Инвентаризация отделения")
+        top.transient(self.root)
+        tk.Label(
+            top,
+            text="Сформировать таблицу уникальных кодов услуг с сопоставлением КСГ\n"
+            "из папки «Отчеты других отделений».",
+            justify=tk.LEFT,
+            wraplength=480,
+        ).pack(padx=12, pady=8, anchor="w")
+        dept_var = StringVar(value=labels[0] if labels else "")
+        ttk.Combobox(top, textvariable=dept_var, values=labels, width=52, state="readonly").pack(
+            padx=12, pady=4, anchor="w"
+        )
+
+        def run():
+            if not labels:
+                return
+            idx = labels.index(dept_var.get()) if dept_var.get() in labels else 0
+            sk = keys[idx]
+            reports = APP_DIR / "Отчеты других отделений"
+            try:
+                table, cats, _meta = inventory_from_source(sk, reports)
+                default_out = APP_DIR / f"инвентарь_{sk}.xlsx"
+                out = filedialog.asksaveasfilename(
+                    parent=top,
+                    title="Сохранить инвентаризацию",
+                    initialdir=str(APP_DIR),
+                    initialfile=default_out.name,
+                    defaultextension=".xlsx",
+                    filetypes=[("Excel", "*.xlsx")],
+                )
+                if not out:
+                    return
+                export_inventory_excel(table, out, summary_key=sk)
+                self.log_message(
+                    f"Инвентаризация {sk}: {len(table)} кодов, {len(cats)} категорий → {out}"
+                )
+                messagebox.showinfo(
+                    "Готово",
+                    f"Кодов: {len(table)}\nКатегорий (1 код = 1 строка): {len(cats)}\n\n{out}",
+                    parent=top,
+                )
+                top.destroy()
+            except Exception as e:
+                self.log_message(traceback.format_exc(), level="ERROR")
+                messagebox.showerror("Ошибка", str(e), parent=top)
+
+        bf = tk.Frame(top)
+        bf.pack(pady=10)
+        _btn(bf, "Сформировать…", run, side=tk.LEFT, padx=4)
+        _btn(bf, "Отмена", top.destroy, side=tk.LEFT, padx=4)
+
+    def create_dept_summary_dialog(self):
+        """Создать Excel-сводную для текущего или выбранного отделения."""
+        sk = self.summary_key
+        summary_cfg = get_summary_cfg(self.config, summary_key=sk)
+        cats = summary_cfg.get("category_rows") or {}
+        if not cats:
+            messagebox.showwarning(
+                "Сводная",
+                f"Для отделения «{self.dept_var.get()}» нет category_rows в config.\n"
+                "Сначала выполните scripts/generate_dept_config.py или инвентаризацию.",
+            )
+            return
+        try:
+            year = int(self.year_var.get())
+        except (TypeError, ValueError):
+            year = int(summary_cfg.get("year") or 2026)
+        default_name = default_summary_filename(self.config, sk, year)
+        out = filedialog.asksaveasfilename(
+            title="Создать сводную для отделения",
+            initialdir=str(APP_DIR),
+            initialfile=default_name,
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+        )
+        if not out:
+            return
+        try:
+            create_from_summary_cfg(out, summary_cfg, self.dept_var.get())
+            self.summary_path.set(out)
+            self.summary_paths_by_dept[self.dept_var.get()] = out
+            self._persist_settings()
+            self.log_message(f"Создана сводная: {out} ({len(cats)} операций)")
+            messagebox.showinfo(
+                "Готово",
+                f"Создан файл:\n{out}\n\nСтрок операций: {len(cats)}\nФорма 4001 не включена.",
+            )
+        except Exception as e:
+            self.log_message(traceback.format_exc(), level="ERROR")
+            messagebox.showerror("Ошибка", str(e))
+
+    def classify_kinds_from_emk_dialog(self):
+        """По загруженной ЭМК: plan/emergency для категорий; спорные — на ручную сверку."""
+        if self.df_emk is None:
+            messagebox.showwarning(
+                "ЭМК",
+                "Сначала загрузите отчёт «Заполнение ЭМК в стационаре».",
+            )
+            return
+        ops = self.get_view_ops() if hasattr(self, "get_view_ops") else self.store.ops
+        if ops is None or ops.empty:
+            messagebox.showwarning("Нет данных", "Загрузите опержурнал текущего отделения")
+            return
+        if ops["Тип_ЭМК"].astype(str).str.strip().eq("").all():
+            messagebox.showwarning(
+                "Нет связи",
+                "КВС журнала и ЭМК не пересекаются — сверка план/экстр невозможна.",
+            )
+            return
+
+        names = list((self.summary_cfg.get("category_rows") or {}).keys())
+        kind = classify_categories_by_emk(ops, category_names=names)
+        report = format_kind_report(kind)
+        self.log_message(report)
+
+        n_disp = len(kind.get("disputed") or [])
+        msg = (
+            f"Плановые: {len(kind['plan'])}\n"
+            f"Экстренные: {len(kind['emergency'])}\n"
+            f"Без ЭМК (оставлены план): {len(kind['no_emk'])}\n"
+            f"Спорные (план и экстр): {n_disp}\n\n"
+            "Записать plan/emergency в config.yaml?"
+        )
+        if n_disp:
+            msg += "\n\nСпорные будут сохранены в Excel для ручной сверки."
+        if not messagebox.askyesno("План/экстр по ЭМК", msg):
+            return
+        try:
+            updated = apply_kind_to_summary_cfg(dict(self.summary_cfg), kind)
+            set_summary_cfg(self.config, self.summary_key, updated)
+            save_config(self.config, APP_DIR / "config.yaml")
+            self._sync_dept_context()
+
+            if n_disp:
+                out = filedialog.asksaveasfilename(
+                    title="Спорные план/экстр",
+                    initialdir=str(APP_DIR),
+                    initialfile=f"спорные_план_экстр_{self.summary_key}.xlsx",
+                    defaultextension=".xlsx",
+                    filetypes=[("Excel", "*.xlsx")],
+                )
+                if out:
+                    disputed_to_dataframe(kind).to_excel(out, index=False)
+                    self.log_message(f"Спорные план/экстр: {out}")
+
+            # обновить цвета/формулы: предложить пересоздать сводную
+            recreate = messagebox.askyesno(
+                "Сводная",
+                "Config обновлён.\n\nПересоздать Excel-сводную с новыми plan/экстр "
+                "(цвета и формулы итогов)?\n"
+                "Текущие числа недель при этом сбросятся — потом снова «Записать в Excel…».",
+            )
+            if recreate:
+                path = self.summary_path.get().strip()
+                if not path:
+                    path = str(
+                        APP_DIR
+                        / default_summary_filename(
+                            self.config, self.summary_key, int(self.year_var.get() or 2026)
+                        )
+                    )
+                create_from_summary_cfg(path, self.summary_cfg, self.dept_var.get())
+                self.summary_path.set(path)
+                self.summary_paths_by_dept[self.dept_var.get()] = path
+                self._persist_settings()
+                self.log_message(f"Сводная пересоздана: {path}")
+
+            if not self.store.ops.empty:
+                self.run_analysis()
+            messagebox.showinfo("Готово", report)
+        except Exception as e:
+            self.log_message(traceback.format_exc(), level="ERROR")
+            messagebox.showerror("Ошибка", str(e))
 
     def add_category_dialog(self):
         """Мастер: добавить неизвестную операцию в config (± Excel)."""
@@ -2862,7 +3133,7 @@ class DesktopApp:
         line_var = StringVar(value="6")
         hist_var = BooleanVar(value=False)
         endo_var = BooleanVar(value=False)
-        anchor_var = StringVar(value=default_anchor_category(self.config))
+        anchor_var = StringVar(value=default_anchor_category(self.config, self.summary_key))
         ksg_query = StringVar(value=defaults.get("code") or defaults.get("name") or "")
         ksg_hint = StringVar(value=hint or "Поиск по KSGoperacii.csv или заполните поля вручную")
 
@@ -2977,15 +3248,17 @@ class DesktopApp:
             if cfg is None:
                 return
             self.config = cfg
-            self.summary_cfg = self.config.get("summary", {})
+            self._sync_dept_context()
             if not self.store.ops.empty:
                 self.run_analysis()
 
         def do_config_only():
             try:
-                _cfg, result = register_category(APP_DIR / "config.yaml", build_spec(), config=self.config)
+                _cfg, result = register_category(
+                    APP_DIR / "config.yaml", build_spec(), config=self.config, summary_key=self.summary_key
+                )
                 self.config = _cfg
-                self.summary_cfg = self.config.get("summary", {})
+                self._sync_dept_context()
                 msg = f"В программе: «{result.name}» → строка Excel {result.excel_row}"
                 if result.warnings:
                     msg += "\n" + "\n".join(result.warnings)
@@ -3013,9 +3286,11 @@ class DesktopApp:
                 return
             try:
                 spec = build_spec()
-                _cfg, result = register_category(APP_DIR / "config.yaml", spec, config=self.config)
+                _cfg, result = register_category(
+                    APP_DIR / "config.yaml", spec, config=self.config, summary_key=self.summary_key
+                )
                 self.config = _cfg
-                self.summary_cfg = self.config.get("summary", {})
+                self._sync_dept_context()
                 sheets = {
                     int(k): v for k, v in (self.summary_cfg.get("sheet_names") or {}).items()
                 }
@@ -3036,9 +3311,9 @@ class DesktopApp:
                 )
                 blank_delta = int(xrep.get("blank_delta") or 0)
                 if blank_delta:
-                    shift_totals_rows_by_delta(self.config, blank_delta)
+                    shift_totals_rows_by_delta(self.config, blank_delta, summary_key=self.summary_key)
                     save_config(self.config, APP_DIR / "config.yaml")
-                    self.summary_cfg = self.config.get("summary", {})
+                    self._sync_dept_context()
                 msg = (
                     f"«{result.name}» → вставлена строка {result.excel_row} "
                     f"({ 'экстр.' if spec.kind == 'emergency' else 'план' })\n"
@@ -3111,7 +3386,7 @@ class DesktopApp:
             if cfg is None:
                 return
             self.config = cfg
-            self.summary_cfg = self.config.get("summary", {})
+            self._sync_dept_context()
             if not self.store.ops.empty:
                 self.run_analysis()
 
@@ -3127,10 +3402,10 @@ class DesktopApp:
                 return
             try:
                 _cfg, result = unregister_category(
-                    APP_DIR / "config.yaml", name, config=self.config
+                    APP_DIR / "config.yaml", name, config=self.config, summary_key=self.summary_key
                 )
                 self.config = _cfg
-                self.summary_cfg = self.config.get("summary", {})
+                self._sync_dept_context()
                 self.log_message(
                     f"Удалено из программы: «{result.name}» (была строка {result.excel_row})"
                 )
@@ -3167,10 +3442,10 @@ class DesktopApp:
                 return
             try:
                 _cfg, result = unregister_category(
-                    APP_DIR / "config.yaml", name, config=self.config
+                    APP_DIR / "config.yaml", name, config=self.config, summary_key=self.summary_key
                 )
                 self.config = _cfg
-                self.summary_cfg = self.config.get("summary", {})
+                self._sync_dept_context()
                 sheets = {
                     int(k): v for k, v in (self.summary_cfg.get("sheet_names") or {}).items()
                 }
@@ -3183,9 +3458,9 @@ class DesktopApp:
                 )
                 blank_delta = int(xrep.get("blank_delta") or 0)
                 if blank_delta:
-                    shift_totals_rows_by_delta(self.config, blank_delta)
+                    shift_totals_rows_by_delta(self.config, blank_delta, summary_key=self.summary_key)
                     save_config(self.config, APP_DIR / "config.yaml")
-                    self.summary_cfg = self.config.get("summary", {})
+                    self._sync_dept_context()
                 msg = (
                     f"Удалено «{result.name}» (строка {result.excel_row})\n"
                     f"Листов: {len(xrep.get('sheets') or [])}, "
@@ -3216,7 +3491,7 @@ class DesktopApp:
             if ops.empty or self.df_emk is None:
                 messagebox.showinfo("Экспорт", "Сначала выполните сверку ЭМК")
                 return
-            result = compare_plan_emergency(ops, self.summary_cfg)
+            result = compare_plan_emergency(ops, self.summary_cfg, department=self.dept_var.get())
             self._fill_emk_tree(result, select_tab=False)
         mismatches = result.get("mismatches") or []
         if not mismatches:

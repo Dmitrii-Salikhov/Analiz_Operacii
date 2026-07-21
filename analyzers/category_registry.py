@@ -9,6 +9,14 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import yaml
 
+from analyzers.dept_config import (
+    ensure_multi_dept_config,
+    form_4001_enabled,
+    get_summary_cfg,
+    get_surgery_categories,
+    set_summary_cfg,
+    set_surgery_categories,
+)
 from analyzers.form_4001 import (
     ENDO_CATS,
     FORM_LINE_LABELS,
@@ -74,11 +82,33 @@ def suggest_keywords_from_name(name: str) -> List[str]:
     return _norm_keywords([w for w in raw.split() if len(w) > 3])[:6]
 
 
-def existing_category_names(config: dict) -> List[str]:
+def _summary_section(config: dict, summary_key: str = "lor") -> dict:
+    ensure_multi_dept_config(config)
+    summaries = config.setdefault("summaries", {})
+    if summary_key not in summaries:
+        summaries[summary_key] = deepcopy(get_summary_cfg(config, summary_key=summary_key) or {})
+    section = summaries[summary_key]
+    if summary_key == "lor":
+        config["summary"] = section
+    return section
+
+
+def _surgery_section(config: dict, summary_key: str = "lor") -> List[dict]:
+    ensure_multi_dept_config(config)
+    cats = get_surgery_categories(config, summary_key=summary_key)
+    by_dept = config.setdefault("surgery_categories_by_dept", {})
+    if summary_key not in by_dept:
+        by_dept[summary_key] = list(cats)
+    if summary_key == "lor":
+        config["surgery_categories"] = by_dept[summary_key]
+    return by_dept[summary_key]
+
+
+def existing_category_names(config: dict, summary_key: str = "lor") -> List[str]:
     names: List[str] = []
-    rows = (config.get("summary") or {}).get("category_rows") or {}
+    rows = (_summary_section(config, summary_key).get("category_rows") or {})
     names.extend(str(k) for k in rows.keys())
-    for cat in config.get("surgery_categories") or []:
+    for cat in _surgery_section(config, summary_key):
         n = str(cat.get("category") or "")
         if n and n not in names:
             names.append(n)
@@ -98,17 +128,17 @@ def _resolve_category_key(rows: dict, name: str) -> str:
     return ""
 
 
-def allocate_excel_row(config: dict, anchor_category: str) -> int:
+def allocate_excel_row(config: dict, anchor_category: str, summary_key: str = "lor") -> int:
     """
     Строка для физической вставки: сразу после якоря (anchor_row + 1).
     Существующие category_rows / totals_rows >= этой строки сдвигаются отдельно.
     """
-    summary = config.get("summary") or {}
+    summary = _summary_section(config, summary_key)
     rows_map: Dict[str, int] = {
         str(k): int(v) for k, v in (summary.get("category_rows") or {}).items()
     }
     if not rows_map:
-        raise CategoryRegistryError("В config нет summary.category_rows")
+        raise CategoryRegistryError("В config нет category_rows для отделения")
 
     key = _resolve_category_key(rows_map, anchor_category)
     if key:
@@ -119,9 +149,9 @@ def allocate_excel_row(config: dict, anchor_category: str) -> int:
     return int(anchor_row) + 1
 
 
-def shift_rows_for_insert(config: dict, insert_at: int) -> None:
+def shift_rows_for_insert(config: dict, insert_at: int, summary_key: str = "lor") -> None:
     """Сдвигает category_rows и totals_rows на +1, если row >= insert_at."""
-    summary = config.setdefault("summary", {})
+    summary = _summary_section(config, summary_key)
     rows = summary.setdefault("category_rows", {})
     for name, row in list(rows.items()):
         if int(row) >= insert_at:
@@ -133,10 +163,11 @@ def shift_rows_for_insert(config: dict, insert_at: int) -> None:
                 totals[key] = int(row) + 1
         except (TypeError, ValueError):
             pass
+    set_summary_cfg(config, summary_key, summary)
 
 
-def default_anchor_category(config: dict) -> str:
-    rows = (config.get("summary") or {}).get("category_rows") or {}
+def default_anchor_category(config: dict, summary_key: str = "lor") -> str:
+    rows = (_summary_section(config, summary_key).get("category_rows") or {})
     if not rows:
         return ""
     # предпочитаем биопсию, иначе последнюю по номеру строки
@@ -177,7 +208,9 @@ def _ensure_line_categories(summary: dict) -> dict:
     return form
 
 
-def apply_category_to_config(config: dict, spec: CategorySpec) -> RegisterResult:
+def apply_category_to_config(
+    config: dict, spec: CategorySpec, summary_key: str = "lor"
+) -> RegisterResult:
     """Мутирует config in-place. Возвращает результат с выбранным excel_row."""
     name = str(spec.name or "").strip()
     if not name:
@@ -187,7 +220,7 @@ def apply_category_to_config(config: dict, spec: CategorySpec) -> RegisterResult
     if spec.kind not in ("plan", "emergency"):
         raise CategoryRegistryError("Тип: plan или emergency")
 
-    existing = set(existing_category_names(config))
+    existing = set(existing_category_names(config, summary_key))
     if name in existing:
         raise CategoryRegistryError(f"Категория уже есть: «{name}»")
 
@@ -195,16 +228,17 @@ def apply_category_to_config(config: dict, spec: CategorySpec) -> RegisterResult
     keywords = _norm_keywords(spec.name_keywords) or suggest_keywords_from_name(name)
     group = (spec.group or "").strip() or FORM_LINE_LABELS.get(spec.form_line, "прочее")
 
-    anchor_raw = (spec.anchor_category or "") or default_anchor_category(config)
-    rows_preview = (config.get("summary") or {}).get("category_rows") or {}
-    anchor_key = _resolve_category_key(rows_preview, anchor_raw) or default_anchor_category(config)
-    excel_row = allocate_excel_row(config, anchor_key)
+    anchor_raw = (spec.anchor_category or "") or default_anchor_category(config, summary_key)
+    summary = _summary_section(config, summary_key)
+    rows_preview = summary.get("category_rows") or {}
+    anchor_key = _resolve_category_key(rows_preview, anchor_raw) or default_anchor_category(config, summary_key)
+    excel_row = allocate_excel_row(config, anchor_key, summary_key)
     warnings: List[str] = []
     if anchor_raw and not _resolve_category_key(rows_preview, anchor_raw):
         warnings.append(f"Якорь «{anchor_raw}» не найден — вставлено после последней категории")
 
-    summary = config.setdefault("summary", {})
-    shift_rows_for_insert(config, excel_row)
+    shift_rows_for_insert(config, excel_row, summary_key)
+    summary = _summary_section(config, summary_key)
     rows = summary.setdefault("category_rows", {})
     rows[name] = excel_row
 
@@ -221,20 +255,25 @@ def apply_category_to_config(config: dict, spec: CategorySpec) -> RegisterResult
         if name in emerg:
             emerg.remove(name)
 
-    form = _ensure_line_categories(summary)
-    line_cats: List[str] = form["line_categories"].setdefault(spec.form_line, list(LINE_TOTAL_CATS.get(spec.form_line, [])))
-    if name not in line_cats:
-        line_cats.append(name)
-    if spec.histology:
-        hist = form["hist_categories"].setdefault(spec.form_line, list(LINE_HIST_CATS.get(spec.form_line, [])))
-        if name not in hist:
-            hist.append(name)
-    if spec.endoscopic:
-        endo = form.setdefault("endo_categories", list(ENDO_CATS))
-        if name not in endo:
-            endo.append(name)
+    if form_4001_enabled(summary):
+        form = _ensure_line_categories(summary)
+        line_cats: List[str] = form["line_categories"].setdefault(
+            spec.form_line, list(LINE_TOTAL_CATS.get(spec.form_line, []))
+        )
+        if name not in line_cats:
+            line_cats.append(name)
+        if spec.histology:
+            hist = form["hist_categories"].setdefault(
+                spec.form_line, list(LINE_HIST_CATS.get(spec.form_line, []))
+            )
+            if name not in hist:
+                hist.append(name)
+        if spec.endoscopic:
+            endo = form.setdefault("endo_categories", list(ENDO_CATS))
+            if name not in endo:
+                endo.append(name)
 
-    surgery = config.setdefault("surgery_categories", [])
+    surgery = _surgery_section(config, summary_key)
     surgery.append(
         {
             "category": name,
@@ -245,6 +284,8 @@ def apply_category_to_config(config: dict, spec: CategorySpec) -> RegisterResult
             "name_keywords": keywords,
         }
     )
+    set_summary_cfg(config, summary_key, summary)
+    set_surgery_categories(config, summary_key, surgery)
 
     return RegisterResult(name=name, excel_row=excel_row, config_path=Path(), warnings=warnings)
 
@@ -253,12 +294,13 @@ def update_category_keywords(
     config: dict,
     category_name: str,
     keywords: Sequence[str],
+    summary_key: str = "lor",
 ) -> List[str]:
-    """Обновляет name_keywords у категории в surgery_categories. Возвращает нормализованный список."""
+    """Обновляет name_keywords у категории. Возвращает нормализованный список."""
     name = str(category_name or "").strip()
     if not name:
         raise CategoryRegistryError("Укажите название категории")
-    surgery = config.setdefault("surgery_categories", [])
+    surgery = _surgery_section(config, summary_key)
     target = None
     for cat in surgery:
         if str(cat.get("category") or "").strip() == name:
@@ -266,13 +308,13 @@ def update_category_keywords(
             break
         emerg = str(cat.get("emergency_category") or "").strip()
         if emerg and emerg == name:
-            # правим ключи у базовой записи (plan), не у emergency_category-метки
             target = cat
             break
     if target is None:
         raise CategoryRegistryError(f"Категория не найдена: «{name}»")
     normed = _norm_keywords(keywords)
     target["name_keywords"] = normed
+    set_surgery_categories(config, summary_key, surgery)
     return normed
 
 
@@ -282,10 +324,11 @@ def update_category_keywords_file(
     keywords: Sequence[str],
     *,
     config: Optional[dict] = None,
+    summary_key: str = "lor",
 ) -> tuple[dict, List[str]]:
     path = Path(config_path)
     cfg = deepcopy(config) if config is not None else load_config(path)
-    normed = update_category_keywords(cfg, category_name, keywords)
+    normed = update_category_keywords(cfg, category_name, keywords, summary_key=summary_key)
     save_config(cfg, path)
     return cfg, normed
 
@@ -319,9 +362,9 @@ class RemoveResult:
     warnings: List[str] = field(default_factory=list)
 
 
-def shift_rows_for_delete(config: dict, delete_at: int) -> None:
+def shift_rows_for_delete(config: dict, delete_at: int, summary_key: str = "lor") -> None:
     """Сдвигает category_rows / totals_rows на −1 для строк > delete_at."""
-    summary = config.setdefault("summary", {})
+    summary = _summary_section(config, summary_key)
     rows = summary.setdefault("category_rows", {})
     for name, row in list(rows.items()):
         r = int(row)
@@ -335,19 +378,21 @@ def shift_rows_for_delete(config: dict, delete_at: int) -> None:
                 totals[key] = r - 1
         except (TypeError, ValueError):
             pass
+    set_summary_cfg(config, summary_key, summary)
 
 
-def shift_totals_rows_by_delta(config: dict, delta: int) -> None:
+def shift_totals_rows_by_delta(config: dict, delta: int, summary_key: str = "lor") -> None:
     """Сдвигает только totals_rows (пустая строка-разделитель перед итогами)."""
     if not delta:
         return
-    summary = config.setdefault("summary", {})
+    summary = _summary_section(config, summary_key)
     totals = summary.setdefault("totals_rows", {})
     for key, row in list(totals.items()):
         try:
             totals[key] = int(row) + int(delta)
         except (TypeError, ValueError):
             pass
+    set_summary_cfg(config, summary_key, summary)
 
 
 def _remove_name_from_lists(summary: dict, name: str) -> None:
@@ -364,12 +409,12 @@ def _remove_name_from_lists(summary: dict, name: str) -> None:
         form["endo_categories"] = [c for c in endo if str(c) != name]
 
 
-def remove_category_from_config(config: dict, name: str) -> RemoveResult:
+def remove_category_from_config(config: dict, name: str, summary_key: str = "lor") -> RemoveResult:
     """Удаляет категорию из config и сдвигает номера строк."""
     name = str(name or "").strip()
     if not name:
         raise CategoryRegistryError("Укажите название категории")
-    summary = config.setdefault("summary", {})
+    summary = _summary_section(config, summary_key)
     rows = summary.setdefault("category_rows", {})
     key = _resolve_category_key(rows, name)
     if not key:
@@ -377,9 +422,11 @@ def remove_category_from_config(config: dict, name: str) -> RemoveResult:
     excel_row = int(rows[key])
     del rows[key]
     _remove_name_from_lists(summary, key)
-    surgery = config.get("surgery_categories") or []
-    config["surgery_categories"] = [c for c in surgery if str(c.get("category") or "") != key]
-    shift_rows_for_delete(config, excel_row)
+    surgery = _surgery_section(config, summary_key)
+    filtered = [c for c in surgery if str(c.get("category") or "") != key]
+    set_surgery_categories(config, summary_key, filtered)
+    shift_rows_for_delete(config, excel_row, summary_key)
+    set_summary_cfg(config, summary_key, summary)
     return RemoveResult(name=key, excel_row=excel_row, config_path=Path())
 
 
@@ -388,10 +435,11 @@ def unregister_category(
     name: str,
     *,
     config: Optional[dict] = None,
+    summary_key: str = "lor",
 ) -> tuple[dict, RemoveResult]:
     path = Path(config_path)
     cfg = deepcopy(config) if config is not None else load_config(path)
-    result = remove_category_from_config(cfg, name)
+    result = remove_category_from_config(cfg, name, summary_key=summary_key)
     save_config(cfg, path)
     result.config_path = path
     return cfg, result
@@ -402,6 +450,7 @@ def register_category(
     spec: CategorySpec,
     *,
     config: Optional[dict] = None,
+    summary_key: str = "lor",
 ) -> tuple[dict, RegisterResult]:
     """
     Загружает config (или использует переданный), регистрирует категорию, сохраняет YAML.
@@ -409,7 +458,7 @@ def register_category(
     """
     path = Path(config_path)
     cfg = deepcopy(config) if config is not None else load_config(path)
-    result = apply_category_to_config(cfg, spec)
+    result = apply_category_to_config(cfg, spec, summary_key=summary_key)
     save_config(cfg, path)
     result.config_path = path
     return cfg, result

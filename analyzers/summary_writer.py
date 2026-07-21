@@ -277,7 +277,22 @@ class SummaryWriter:
 
                 title = f"{self.department} за {MONTH_RU.get(int(month), '')} {year}".strip()
                 if self.department:
-                    ws.cell(1, 1).value = title
+                    form_on = bool((self.form_4001_cfg or {}).get("enabled", False))
+                    if form_on:
+                        # ЛОР: заголовок в A1
+                        ws.cell(1, 1).value = title
+                    else:
+                        # сводные отделений: заголовок в B1, A узкий
+                        ws.cell(1, 1).value = None
+                        cell_title = ws.cell(1, 2)
+                        cell_title.value = title
+                        try:
+                            from openpyxl.styles import Font
+
+                            cell_title.font = Font(bold=True)
+                        except Exception:
+                            pass
+                        ws.column_dimensions["A"].width = 13.0
 
             form_info = {}
             if write_form and self.form_4001_cfg.get("enabled", True):
@@ -304,6 +319,14 @@ class SummaryWriter:
             }
 
         wb.save(out)
+        # openpyxl может вернуть старую тему — для non-LOR снова подставляем тему ЛОР
+        if not bool((self.form_4001_cfg or {}).get("enabled", False)):
+            try:
+                from analyzers.dept_template import apply_lor_workbook_theme
+
+                apply_lor_workbook_theme(out)
+            except Exception:
+                pass
         report["output"] = str(out)
         return report
 
