@@ -1,0 +1,48 @@
+# schemas/config_keys.schema.yaml
+id: config_keys
+storage: config.yaml
+sections:
+  - id: departments
+    keys: [main, list]
+  - id: thresholds
+    keys: [max_bed_days, pension_age]
+  - id: updates
+    keys:
+      - enabled
+      - github_owner
+      - github_repo
+      - branch
+      - check_on_startup
+      - check_interval_days
+      - github_token_env
+      - zip_filename
+      - sha256_filename
+  - id: department_profiles
+    map_of: [summary_key, rubricator]
+  - id: summaries
+    keys_per_dept:
+      - default_path
+      - backup_keep
+      - year
+      - sheet_names
+      - category_rows
+      - totals_rows
+      - plan_categories
+      - emergency_categories
+      - form_4001
+  - id: form_4001
+    only_for: lor
+    keys:
+      - enabled
+      - line_rows
+      - parent_row
+      - total_row
+      - pension_row
+      - cols
+      - line_categories
+      - hist_categories
+      - endo_categories
+  - id: surgery_categories
+    item_keys: [category, codes, group, line, histology, name_keywords]
+  - id: legacy_aliases
+    note: summary ↔ summaries.lor; surgery_categories ↔ surgery_categories_by_dept.lor

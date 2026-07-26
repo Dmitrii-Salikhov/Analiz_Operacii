@@ -1,0 +1,100 @@
+# schemas/form14_constructor.schema.yaml
+# Схемные параметры конструктора ФСН 14 (хирургическая калибровка)
+
+id: form14_constructor
+title: Конструктор ФСН 14
+storage: form14_overrides.yaml
+backend:
+  load: analyzers.form14_overrides.load_overrides
+  save: analyzers.form14_overrides.save_overrides
+  rows: analyzers.form14_export.build_mapping_rows
+  export_excel: analyzers.form14_export.write_form14_excel
+  import_excel: analyzers.form14_overrides.import_overrides_from_excel
+  line_choices: analyzers.form14_export.form14_line_choices
+  parse_line: analyzers.form14_export.parse_line_choice
+
+filters:
+  - id: dept_key
+    label: Отделение
+    type: enum
+    options_source: dept_keys_with_all
+    default: current_or_all
+  - id: only_disputed
+    label: Только спорные (низкая уверенность / стр. 21)
+    type: bool
+    default: true
+  - id: search
+    label: Поиск
+    type: text
+    default: ""
+
+table_columns:
+  - id: code
+    label: Код
+    field: Код
+  - id: name
+    label: Название
+    field: Наименование_КСГ
+  - id: dept
+    label: Отделение
+    field: Отделение
+  - id: auto
+    label: Авто
+    field: Авто
+  - id: final
+    label: Итог
+    field: Строка_ФСН14
+  - id: conf
+    label: Уверенность
+    field: Уверенность
+  - id: src
+    label: Основание
+    field: Правило
+  - id: comment
+    label: Комментарий
+    field: Комментарий
+
+# Параметры назначения (панель редактирования)
+parameters:
+  - id: form14_line
+    label: Строка формы № 14
+    type: enum
+    options_source: form14_lines
+    required: true
+    maps_to: line
+    description: Номер строки таблиц 4000/4001 формы № 14
+  - id: comment
+    label: Комментарий
+    type: text
+    maps_to: comment
+    description: Пояснение хирурга к переназначению
+  - id: apply_by_code
+    label: Привязка
+    type: const
+    value: code_preferred
+    description: Сохраняется по коду A16; если кода нет — по категории
+
+actions:
+  - id: assign
+    label: Назначить
+    api: set_override
+  - id: reset
+    label: Сбросить
+    api: clear_override
+  - id: save
+    label: Сохранить
+    api: save_overrides
+  - id: export_excel
+    label: Экспорт Excel…
+    api: write_form14_excel
+  - id: import_excel
+    label: Импорт Excel…
+    api: import_overrides_from_excel
+
+excel:
+  manual_col: Строка_ФСН14_ручная
+  comment_col: Комментарий
+  sheets: [Все коды, Спорные_низкая_и_21]
+
+priority_note: >
+  Приоритет: ручная правка → калибровка отделения → авто (класс A16 и слова) → стр. 21 «прочие».

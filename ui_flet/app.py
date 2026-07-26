@@ -1,0 +1,954 @@
+# ui_flet/app.py
+"""Полноценное Flet-приложение: тот же backend, что Tk, + конструктор ФСН 14."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Optional
+
+import flet as ft
+
+from analyzers.summary_writer import MONTH_RU
+from ui_flet.app_context import AppContext
+from ui_flet.screens.form14 import Form14ConstructorView
+from ui_flet.session import AppSession
+
+NAV = [
+    ("work", "Работа", ft.Icons.HOME),
+    ("preview", "Превью", ft.Icons.TABLE_CHART),
+    ("emk", "ЭМК", ft.Icons.COMPARE_ARROWS),
+    ("uncl", "Не класс.", ft.Icons.HELP_OUTLINE),
+    ("disp", "Спорные", ft.Icons.WARNING_AMBER),
+    ("form14", "ФСН 14", ft.Icons.EDIT_NOTE),
+    ("log", "Журнал", ft.Icons.ARTICLE),
+]
+
+NAV_TIP = {
+    "work": "Источники, настройки и сводка по загруженным данным",
+    "preview": "Таблица по неделям: категории, итоги, форма 4001",
+    "emk": "Сверка план/экстренные с выгрузкой ЭМК",
+    "uncl": "Операции без категории в рубрикаторе",
+    "disp": "Операции с несколькими кандидатами категории",
+    "form14": "Конструктор соответствия кодов строкам формы № 14",
+    "log": "Журнал работы приложения (analysis.log)",
+}
+
+
+class AnalizApp:
+    def __init__(self, page: ft.Page):
+        self.page = page
+        self.session = AppSession(log=self._on_log_line)
+        self.log_lines: List[str] = []
+        self.current_key = "work"
+        self._preview_section = 0  # 0 категории / 1 итоги / 2 форма 4001
+        self.nav_index = 0
+        self.status = ft.Text(self.session.status, size=12)
+        self.body = ft.Container(
+            expand=True,
+            padding=16,
+            bgcolor=ft.Colors.SURFACE,
+            alignment=ft.Alignment.TOP_LEFT,
+            content=ft.Text("Загрузка…"),
+        )
+        self.file_picker = ft.FilePicker()
+        try:
+            page.services.append(self.file_picker)
+        except Exception:
+            page.overlay.append(self.file_picker)
+
+        page.title = f"Сводная операций  v{self.session.version}"
+        page.window.width = 1280
+        page.window.height = 820
+        page.window.min_width = 960
+        page.window.min_height = 640
+        page.padding = 0
+        page.bgcolor = ft.Colors.SURFACE
+
+        self._build_chrome()
+        self.sidebar = self._build_sidebar()
+        page.add(
+            ft.Column(
+                [
+                    self.top_bar,
+                    ft.Row(
+                        [
+                            self.sidebar,
+                            ft.VerticalDivider(width=1),
+                            self.body,
+                        ],
+                        expand=True,
+                        spacing=0,
+                        vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                    ),
+                    ft.Container(
+                        content=self.status,
+                        padding=ft.Padding(left=12, right=12, top=6, bottom=6),
+                        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+                    ),
+                ],
+                expand=True,
+                spacing=0,
+            )
+        )
+        self.show("work")
+
+    def _on_log_line(self, line: str) -> None:
+        self.log_lines.append(line)
+        if len(self.log_lines) > 500:
+            self.log_lines = self.log_lines[-500:]
+
+    def _snack(self, msg: str) -> None:
+        try:
+            self.page.show_dialog(ft.SnackBar(content=ft.Text(msg), open=True))
+        except Exception:
+            self.status.value = msg
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+    def _set_status(self, msg: Optional[str] = None) -> None:
+        self.status.value = msg or self.session.status
+
+    def _build_chrome(self) -> None:
+        self.dept_dd = ft.Dropdown(
+            label="Отделение",
+            width=260,
+            dense=True,
+            options=[ft.dropdown.Option(d) for d in self.session.departments()],
+            value=self.session.department,
+            on_select=self._on_dept,
+            tooltip="Текущее отделение для фильтра журнала и сводной",
+        )
+        self.top_bar = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Text(f"v{self.session.version}", weight=ft.FontWeight.BOLD),
+                    self.dept_dd,
+                    ft.FilledButton(
+                        "Опержурнал…",
+                        tooltip="Загрузить один или несколько файлов опержурнала",
+                        on_click=self._pick_surg,
+                    ),
+                    ft.OutlinedButton(
+                        "Из папки…",
+                        tooltip="Загрузить все Excel/CSV опержурналы из выбранной папки",
+                        on_click=self._pick_surg_folder,
+                    ),
+                    ft.OutlinedButton(
+                        "ЭМК…",
+                        tooltip="Загрузить выгрузку ЭМК для сверки план/экстренные",
+                        on_click=self._pick_emk,
+                    ),
+                    ft.FilledButton(
+                        "Обновить",
+                        tooltip="Пересчитать анализ и превью по загруженным данным",
+                        on_click=lambda e: self._run_analysis(),
+                    ),
+                    ft.FilledButton(
+                        "В Excel…",
+                        tooltip="Записать недели и форму 4001 в файл сводной",
+                        on_click=self._write_excel,
+                    ),
+                    ft.OutlinedButton(
+                        "Отчёт…",
+                        tooltip="Сохранить простой отчёт по текущему месяцу превью",
+                        on_click=self._export_report,
+                    ),
+                    ft.OutlinedButton(
+                        "Открыть Excel",
+                        tooltip="Открыть файл сводной во внешнем Excel",
+                        on_click=self._open_excel,
+                    ),
+                ],
+                spacing=8,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+            padding=ft.Padding(left=12, right=12, top=10, bottom=10),
+            bgcolor=ft.Colors.SURFACE_CONTAINER,
+        )
+
+    def _kpi_cards(self) -> ft.Control:
+        k = self.session.kpi
+        items = [
+            ("Операций", k["ops"]),
+            ("Пациентов", k["patients"]),
+            ("План", k["plan"]),
+            ("Экстренных", k["emerg"]),
+            ("Период", k["period"]),
+            ("Файлы / ЭМК", k["files"]),
+            ("Расхождений ЭМК", k["diff"]),
+        ]
+
+        def card(title: str, value: str) -> ft.Control:
+            return ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Text(title, size=11, color=ft.Colors.ON_SURFACE_VARIANT),
+                        ft.Text(str(value), size=16, weight=ft.FontWeight.BOLD),
+                    ],
+                    spacing=2,
+                ),
+                padding=ft.Padding(left=12, right=12, top=10, bottom=10),
+                bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
+                border_radius=8,
+            )
+
+        return ft.Column(
+            [
+                ft.Text("Сводка", size=16, weight=ft.FontWeight.BOLD),
+                ft.Row([card(t, v) for t, v in items], wrap=True, spacing=8, run_spacing=8),
+            ],
+            spacing=8,
+        )
+
+    def _build_sidebar(self) -> ft.Control:
+        def mk(i: int, key: str, lab: str, ic):
+            selected = i == self.nav_index
+
+            def go(_e=None, _i=i, _k=key):
+                self.nav_index = _i
+                self.show(_k)
+
+            return ft.Container(
+                content=ft.Row(
+                    [
+                        ft.Icon(ic, size=18),
+                        ft.Text(lab, size=12, weight=ft.FontWeight.BOLD if selected else None),
+                    ],
+                    spacing=8,
+                ),
+                padding=ft.Padding(left=10, right=10, top=8, bottom=8),
+                bgcolor=ft.Colors.PRIMARY_CONTAINER if selected else None,
+                border_radius=8,
+                ink=True,
+                on_click=go,
+                tooltip=NAV_TIP.get(key, lab),
+            )
+
+        items = [mk(i, key, lab, ic) for i, (key, lab, ic) in enumerate(NAV)]
+        return ft.Container(
+            width=130,
+            padding=8,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+            content=ft.Column(items, spacing=4, scroll=ft.ScrollMode.AUTO, expand=True),
+        )
+
+    def _refresh_sidebar(self) -> None:
+        self.sidebar.content = self._build_sidebar().content
+        self.sidebar.bgcolor = ft.Colors.SURFACE_CONTAINER_LOW
+
+    def _on_dept(self, e) -> None:
+        self.session.set_department(self.dept_dd.value or self.session.department)
+        self._snack(f"Отделение: {self.session.department}")
+        if not self.session.store.ops.empty:
+            self._run_analysis()
+
+    def show(self, key: str) -> None:
+        builders = {
+            "work": self._screen_work,
+            "preview": self._screen_preview,
+            "emk": self._screen_emk,
+            "uncl": self._screen_uncl,
+            "disp": self._screen_disp,
+            "form14": self._screen_form14,
+            "log": self._screen_log,
+        }
+        self.current_key = key
+        for i, (k, _, _) in enumerate(NAV):
+            if k == key:
+                self.nav_index = i
+                break
+        try:
+            self.body.content = builders.get(key, self._screen_work)()
+        except Exception:
+            import traceback
+
+            tb = traceback.format_exc()
+            self.session.log(tb, level="ERROR")
+            self.body.content = ft.Column(
+                [
+                    ft.Text(f"Ошибка экрана «{key}»", color=ft.Colors.ERROR, size=18),
+                    ft.Text(tb, selectable=True, size=11),
+                ],
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+            )
+        self._refresh_sidebar()
+        self._set_status()
+        self.page.update()
+
+    # ——— actions ———
+    async def _pick_surg(self, _e=None) -> None:
+        files = await self.file_picker.pick_files(
+            dialog_title="Опержурнал(ы)",
+            allow_multiple=True,
+            allowed_extensions=["xlsx", "xls", "csv"],
+            file_type=ft.FilePickerFileType.CUSTOM,
+            initial_directory=self.session.last_surg_dir,
+        )
+        if not files:
+            return
+        paths = [f.path for f in files if getattr(f, "path", None)]
+        if not paths:
+            self.session.log(
+                "FilePicker не вернул path (файлы: "
+                + ", ".join(getattr(f, "name", "?") for f in files)
+                + ")",
+                level="ERROR",
+            )
+            self._snack("Не удалось получить пути к файлам")
+            return
+        self.session.last_surg_dir = str(Path(paths[0]).parent)
+        try:
+            self.session.ingest_surg_paths(paths)
+            self._snack(f"Загружено файлов: {len(paths)}")
+            self.nav_index = 1
+            self.show("preview")
+        except Exception as ex:
+            import traceback
+
+            self.session.log(traceback.format_exc(), level="ERROR")
+            self._snack(str(ex))
+
+    async def _pick_surg_folder(self, _e=None) -> None:
+        folder = await self.file_picker.get_directory_path(
+            dialog_title="Папка с опержурналами",
+            initial_directory=self.session.last_surg_dir,
+        )
+        if not folder:
+            return
+        base = Path(folder)
+        self.session.last_surg_dir = folder
+        paths = sorted(
+            [*(base.glob("*.xlsx")), *(base.glob("*.xls")), *(base.glob("*.csv"))],
+            key=lambda p: p.name.lower(),
+        )
+        paths = [p for p in paths if not p.name.startswith("~$") and ".bak." not in p.name.lower()]
+        if not paths:
+            self._snack("В папке нет Excel/CSV")
+            return
+        try:
+            self.session.ingest_surg_paths([str(p) for p in paths])
+            self._snack(f"Из папки: {len(paths)} файлов")
+            self.nav_index = 1
+            self.show("preview")
+        except Exception as ex:
+            self._snack(str(ex))
+
+    async def _pick_emk(self, _e=None) -> None:
+        files = await self.file_picker.pick_files(
+            dialog_title="ЭМК",
+            allow_multiple=False,
+            allowed_extensions=["xlsx", "xls", "csv"],
+            initial_directory=self.session.last_emk_dir,
+        )
+        if not files or not getattr(files[0], "path", None):
+            return
+        try:
+            self.session.load_emk_path(files[0].path)
+            self._snack("ЭМК загружен")
+            self.show("emk")
+        except Exception as ex:
+            self._snack(str(ex))
+
+    def _run_analysis(self) -> None:
+        try:
+            self.session.run_analysis()
+            self._snack(self.session.status)
+            self.show(self.current_key)
+        except Exception as ex:
+            self._snack(str(ex))
+
+    async def _write_excel(self, _e=None) -> None:
+        if self.session.store.ops.empty:
+            self._snack("Сначала загрузите опержурнал")
+            return
+        path = self.session.summary_path
+        if not path or not Path(path).exists():
+            # выбрать сводную
+            files = await self.file_picker.pick_files(
+                dialog_title="Выберите файл сводной",
+                allow_multiple=False,
+                allowed_extensions=["xlsx"],
+                initial_directory=str(Path(path).parent if path else self.session.app_dir),
+            )
+            if not files or not files[0].path:
+                return
+            self.session.summary_path = files[0].path
+            self.session.persist()
+
+        write_form = self.session.write_form and self.session.form4001_enabled()
+        try:
+            report = self.session.write_excel(
+                write_weeks=self.session.write_weeks,
+                write_form=write_form,
+            )
+            msg = f"Записано ячеек: {report.get('cells_written', 0)}"
+            if report.get("backup"):
+                msg += f"\nБэкап: {Path(report['backup']).name}"
+            if report.get("verify_msg"):
+                msg += f"\n{report['verify_msg']}"
+            self._snack(msg)
+            self._set_status()
+        except Exception as ex:
+            self._snack(str(ex))
+
+    async def _export_report(self, _e=None) -> None:
+        if self.session.store.ops.empty:
+            self._snack("Нет данных")
+            return
+        month = self.session.month_label_to_num.get(self.session.preview_month)
+        default = f"Отчёт_{MONTH_RU.get(month or 0, 'период')}_{self.session.year}.xlsx"
+        path = await self.file_picker.save_file(
+            dialog_title="Экспорт отчёта",
+            file_name=default,
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allowed_extensions=["xlsx"],
+            initial_directory=str(self.session.app_dir),
+        )
+        if not path:
+            path = str(self.session.app_dir / default)
+        try:
+            self.session.export_simple_report(path)
+            self._snack(f"Отчёт: {path}")
+        except Exception as ex:
+            self._snack(str(ex))
+
+    def _open_excel(self, _e=None) -> None:
+        p = self.session.summary_path
+        if not p or not Path(p).exists():
+            self._snack("Файл сводной не найден")
+            return
+        self.session.open_path(p)
+
+    # ——— screens ———
+    def _screen_work(self) -> ft.Control:
+        s = self.session
+        year_tf = ft.TextField(label="Год", value=str(s.year), width=90, dense=True)
+        start_tf = ft.TextField(label="Дата с", value=s.start_date, width=120, dense=True)
+        end_tf = ft.TextField(label="Дата по", value=s.end_date, width=120, dense=True)
+        sum_tf = ft.TextField(label="Сводная", value=s.summary_path, expand=True, dense=True)
+        filt = ft.Switch(label="Фильтр дат", value=s.filter_enabled)
+        hide = ft.Switch(label="Скрыть нули", value=s.hide_zeros)
+        plan = ft.Dropdown(
+            label="План/экстр",
+            width=160,
+            dense=True,
+            options=[
+                ft.dropdown.Option("template", "По шаблону"),
+                ft.dropdown.Option("emk", "Сверка ЭМК"),
+            ],
+            value=s.plan_mode,
+        )
+        weeks_sw = ft.Switch(label="Писать недели", value=s.write_weeks)
+        form_sw = ft.Switch(
+            label="Писать форму 4001",
+            value=s.write_form and s.form4001_enabled(),
+            disabled=not s.form4001_enabled(),
+        )
+        sources = ft.Text(s.sources_text(), selectable=True)
+        emk = ft.Text(s.emk_status_text())
+
+        def apply(_e=None):
+            try:
+                s.year = int(year_tf.value or s.year)
+            except ValueError:
+                pass
+            s.start_date = start_tf.value or s.start_date
+            s.end_date = end_tf.value or s.end_date
+            s.summary_path = sum_tf.value or s.summary_path
+            s.filter_enabled = bool(filt.value)
+            s.hide_zeros = bool(hide.value)
+            s.plan_mode = plan.value or "template"
+            s.write_weeks = bool(weeks_sw.value)
+            s.write_form = bool(form_sw.value) if s.form4001_enabled() else False
+            s.persist()
+            if not s.store.ops.empty:
+                s.run_analysis()
+            self._snack("Настройки применены")
+            self._set_status()
+
+        async def choose_summary(_e=None):
+            files = await self.file_picker.pick_files(
+                dialog_title="Сводная",
+                allow_multiple=False,
+                allowed_extensions=["xlsx"],
+            )
+            if files and files[0].path:
+                sum_tf.value = files[0].path
+                self.page.update()
+
+        return ft.Column(
+            [
+                ft.Text("Источники и настройки", size=20, weight=ft.FontWeight.BOLD),
+                self._kpi_cards(),
+                ft.Divider(),
+                ft.Text(
+                    "Загрузите опержурнал → Обновить → Превью → Записать в Excel / Отчёт. "
+                    "Конструктор ФСН 14 — в разделе слева.",
+                    size=13,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ),
+                ft.Row([year_tf, start_tf, end_tf, filt, hide, plan], wrap=True),
+                ft.Row(
+                    [
+                        sum_tf,
+                        ft.OutlinedButton(
+                            "Обзор…",
+                            tooltip="Выбрать файл сводной Excel",
+                            on_click=choose_summary,
+                        ),
+                    ],
+                    expand=True,
+                ),
+                ft.Row(
+                    [
+                        weeks_sw,
+                        form_sw,
+                        ft.FilledButton(
+                            "Применить",
+                            tooltip="Сохранить настройки и пересчитать анализ",
+                            on_click=apply,
+                        ),
+                    ]
+                ),
+                ft.Divider(),
+                ft.Text("Опержурналы", weight=ft.FontWeight.BOLD),
+                ft.Container(content=sources, padding=8, bgcolor=ft.Colors.SURFACE_CONTAINER_LOW),
+                emk,
+                ft.Row(
+                    [
+                        ft.OutlinedButton(
+                            "Очистить накопитель",
+                            tooltip="Удалить все загруженные операции из памяти",
+                            on_click=self._clear,
+                        ),
+                        ft.OutlinedButton(
+                            "План/экстр по ЭМК → config",
+                            tooltip="Записать классификацию план/экстренные из ЭМК в config.yaml",
+                            on_click=self._classify_kinds,
+                        ),
+                    ]
+                ),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+            spacing=10,
+        )
+
+    def _clear(self, _e=None) -> None:
+        self.session.clear_store()
+        self._snack("Очищено")
+        self.show("work")
+
+    def _classify_kinds(self, _e=None) -> None:
+        try:
+            kind = self.session.classify_kinds_from_emk()
+            self._snack(
+                f"Экстр.: {len(kind.get('emergency') or [])}, план: {len(kind.get('plan') or [])}"
+            )
+        except Exception as ex:
+            self._snack(str(ex))
+
+    def _screen_preview(self) -> ft.Control:
+        s = self.session
+        labels = list(s.month_label_to_num.keys()) or list(MONTH_RU.values())
+        month_dd = ft.Dropdown(
+            label="Месяц",
+            width=160,
+            dense=True,
+            options=[ft.dropdown.Option(x) for x in labels],
+            value=s.preview_month if s.preview_month in labels else (labels[-1] if labels else None),
+            on_select=lambda e: self._change_month(month_dd.value),
+            tooltip="Месяц для превью сводной",
+        )
+        pb = s.preview
+        form_tab = "Форма 4001" if pb.form_kind == "4001" else "Форма № 14"
+        sections = ["Категории", "Итоги", form_tab]
+        seg = self._preview_section if 0 <= self._preview_section < 3 else 0
+
+        def switch(i: int):
+            def _h(_e=None):
+                self._preview_section = i
+                self.show("preview")
+
+            return _h
+
+        if seg == 0:
+            content = self._table(
+                ["Категория"] + list(pb.week_headers) + ["ИТОГ"],
+                pb.cat_rows,
+            )
+        elif seg == 1:
+            content = self._table(
+                ["Показатель"] + list(pb.week_headers) + ["ИТОГ"],
+                pb.tot_rows,
+            )
+        else:
+            content = self._form_table(pb.form_rows, kind=pb.form_kind)
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text("Превью", size=20, weight=ft.FontWeight.BOLD),
+                        month_dd,
+                        ft.Text(pb.info or "Нет данных — загрузите журнал", size=12),
+                    ],
+                    wrap=True,
+                ),
+                ft.Row(
+                    [
+                        (
+                            ft.FilledButton(
+                                lab,
+                                tooltip=f"Показать: {lab}",
+                                on_click=switch(i),
+                            )
+                            if i == seg
+                            else ft.OutlinedButton(
+                                lab,
+                                tooltip=f"Показать: {lab}",
+                                on_click=switch(i),
+                            )
+                        )
+                        for i, lab in enumerate(sections)
+                    ],
+                    spacing=8,
+                ),
+                ft.Container(content=content, expand=True),
+            ],
+            expand=True,
+            spacing=10,
+        )
+
+    def _change_month(self, label: Optional[str]) -> None:
+        if not label:
+            return
+        self.session.preview_month = label
+        self.session.build_preview()
+        self.show("preview")
+
+    def _data_table(
+        self,
+        headers: List[str],
+        rows: List[List],
+        *,
+        numeric_from: int = 1,
+        highlight_total: bool = True,
+    ) -> ft.Control:
+        if not rows:
+            return ft.Text("Нет строк")
+        total_idx = None
+        if highlight_total:
+            for i, h in enumerate(headers):
+                if str(h).strip().upper() in ("ИТОГ", "ВСЕГО"):
+                    total_idx = i
+                    break
+            if total_idx is None and len(headers) > 1:
+                # последняя числовая колонка — обычно итог
+                total_idx = len(headers) - 1
+
+        columns = []
+        for i, h in enumerate(headers):
+            is_tot = total_idx is not None and i == total_idx
+            columns.append(
+                ft.DataColumn(
+                    label=ft.Text(
+                        str(h),
+                        weight=ft.FontWeight.BOLD,
+                        size=12,
+                    ),
+                    numeric=(i >= numeric_from),
+                )
+            )
+        data_rows = []
+        for r in rows[:500]:
+            cells = []
+            for i, _h in enumerate(headers):
+                val = r[i] if i < len(r) else ""
+                is_tot = total_idx is not None and i == total_idx
+                cells.append(
+                    ft.DataCell(
+                        ft.Text(
+                            str(val),
+                            size=12,
+                            weight=ft.FontWeight.BOLD if (i == 0 or is_tot) else None,
+                        )
+                    )
+                )
+            data_rows.append(ft.DataRow(cells=cells))
+        table = ft.DataTable(
+            columns=columns,
+            rows=data_rows,
+            border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
+            border_radius=8,
+            heading_row_color=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+            data_row_min_height=36,
+            heading_row_height=40,
+            column_spacing=16,
+            horizontal_lines=ft.BorderSide(1, ft.Colors.OUTLINE_VARIANT),
+            show_checkbox_column=False,
+        )
+        return ft.Column(
+            [ft.Row([table], scroll=ft.ScrollMode.AUTO)],
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+    def _table(self, headers: List[str], rows: List[List]) -> ft.Control:
+        return self._data_table(headers, rows, numeric_from=1)
+
+    def _form_table(self, rows: List[dict], *, kind: str = "4001") -> ft.Control:
+        if not rows:
+            if kind == "14":
+                return ft.Text("Нет данных формы № 14 за выбранный месяц")
+            return ft.Text("Нет данных формы 4001 (для не-ЛОР используйте превью формы № 14)")
+        headers = [
+            "Наименование",
+            "Стр.",
+            "Всего",
+            "0–14 лет",
+            "До 1 года",
+            "15–17 лет",
+            "Морфология",
+            "Старше трудоспособного",
+        ]
+        data = [
+            [
+                r.get("name", ""),
+                r.get("line", ""),
+                r.get("total", ""),
+                r.get("age_0_14", ""),
+                r.get("age_under_1", ""),
+                r.get("age_15_17", ""),
+                r.get("histology", ""),
+                r.get("senior", ""),
+            ]
+            for r in rows
+        ]
+        return self._data_table(headers, data, numeric_from=2)
+
+    def _screen_emk(self) -> ft.Control:
+        rows = self.session.emk_mismatch_rows
+        lines = [f"Расхождений: {len(rows)}", self.session.emk_status_text(), ""]
+        lines.append("Дата | КВС | Категория | Шаблон | ЭМК")
+        for r in rows[:400]:
+            lines.append(
+                f"{r.get('Дата')} | {r.get('КВС')} | {r.get('Категория')} | "
+                f"{r.get('Шаблон')} | {r.get('ЭМК')}"
+            )
+
+        async def exp(_e):
+            path = await self.file_picker.save_file(
+                file_name="расхождения_эмк.xlsx",
+                allowed_extensions=["xlsx", "csv"],
+            )
+            if not path:
+                return
+            n = self.session.export_emk_mismatches(path)
+            self._snack(f"Экспорт: {n} строк")
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text("Расхождения ЭМК", size=20, weight=ft.FontWeight.BOLD),
+                        ft.OutlinedButton(
+                            "Обновить сверку",
+                            tooltip="Пересчитать расхождения план/экстренные с ЭМК",
+                            on_click=lambda e: self._refresh_emk(),
+                        ),
+                        ft.OutlinedButton(
+                            "Экспорт…",
+                            tooltip="Сохранить таблицу расхождений в Excel/CSV",
+                            on_click=exp,
+                        ),
+                    ]
+                ),
+                ft.Text("\n".join(lines), selectable=True, size=12),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+    def _refresh_emk(self) -> None:
+        self.session.refresh_emk_compare()
+        self.show("emk")
+
+    def _screen_uncl(self) -> ft.Control:
+        rows = self.session.unclassified_rows
+        lines = [f"Не классифицировано: {len(rows)}", "Дата | КВС | Код | КСГ | Услуга"]
+        for r in rows[:500]:
+            lines.append(
+                f"{r.get('Дата')} | {r.get('КВС')} | {r.get('Код')} | "
+                f"{r.get('КСГ_название')} | {r.get('Услуга')}"
+            )
+
+        async def exp(_e):
+            path = await self.file_picker.save_file(
+                file_name="неклассифицировано.xlsx",
+                allowed_extensions=["xlsx", "csv"],
+            )
+            if not path:
+                return
+            n = self.session.export_unclassified(path)
+            self._snack(f"Экспорт: {n}")
+
+        async def problems(_e):
+            path = await self.file_picker.save_file(
+                file_name="проблемные_коды.xlsx",
+                allowed_extensions=["xlsx", "csv"],
+            )
+            if not path:
+                return
+            n = self.session.export_problem_codes(path)
+            self._snack(f"Проблемных кодов: {n}")
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text("Не классифицировано", size=20, weight=ft.FontWeight.BOLD),
+                        ft.OutlinedButton(
+                            "Экспорт…",
+                            tooltip="Сохранить неклассифицированные операции в файл",
+                            on_click=exp,
+                        ),
+                        ft.OutlinedButton(
+                            "Проблемные коды…",
+                            tooltip="Выгрузить коды без устойчивой категории",
+                            on_click=problems,
+                        ),
+                    ]
+                ),
+                ft.Text("\n".join(lines), selectable=True, size=12),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+    def _screen_disp(self) -> ft.Control:
+        rows = self.session.disputed_rows
+        lines = [f"Спорные: {len(rows)}", "Дата | КВС | Код | Категория | Кандидаты"]
+        for r in rows[:500]:
+            lines.append(
+                f"{r.get('Дата')} | {r.get('КВС')} | {r.get('Код')} | "
+                f"{r.get('Категория')} | {r.get('Кандидаты')}"
+            )
+        return ft.Column(
+            [
+                ft.Text("Спорные по ключам", size=20, weight=ft.FontWeight.BOLD),
+                ft.Text("\n".join(lines), selectable=True, size=12),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
+
+    def _screen_form14(self) -> ft.Control:
+        ctx = AppContext(self.session.app_dir)
+        ctx.config = self.session.config
+        ctx.settings["department"] = self.session.department
+        view = Form14ConstructorView(
+            self.page,
+            ctx,
+            on_back=lambda: self.show("work"),
+            default_dept_key=self.session.summary_key,
+        )
+        return view.build()
+
+    def _screen_log(self) -> ft.Control:
+        lines = self.session.log_lines_list() or list(self.log_lines)
+        n = len(lines)
+        status = ft.Text(f"Строк: {n} / 500 (старые удаляются)", size=12)
+
+        list_view = ft.ListView(
+            expand=True,
+            spacing=2,
+            auto_scroll=True,
+            controls=[
+                ft.Text(ln, selectable=True, size=11, font_family="Menlo")
+                for ln in (lines or ["(пусто)"])
+            ],
+        )
+
+        def refresh(_e=None):
+            cur = self.session.log_lines_list() or list(self.log_lines)
+            list_view.controls = [
+                ft.Text(ln, selectable=True, size=11, font_family="Menlo")
+                for ln in (cur or ["(пусто)"])
+            ]
+            status.value = f"Строк: {len(cur)} / 500 (старые удаляются)"
+            list_view.auto_scroll = True
+            self.page.update()
+            try:
+                list_view.scroll_to(offset=-1, duration=200)
+            except Exception:
+                pass
+
+        def clear(_e=None):
+            self.session.clear_log()
+            self.log_lines.clear()
+            refresh()
+
+        # прокрутка к последнему событию после отрисовки
+        try:
+            self.page.run_task(self._scroll_log_end, list_view)
+        except Exception:
+            pass
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text("Журнал", size=20, weight=ft.FontWeight.BOLD),
+                        status,
+                        ft.OutlinedButton(
+                            "Обновить",
+                            tooltip="Перечитать analysis.log (не более 500 строк)",
+                            on_click=refresh,
+                        ),
+                        ft.OutlinedButton(
+                            "Очистить",
+                            tooltip="Очистить файл журнала",
+                            on_click=clear,
+                        ),
+                        ft.OutlinedButton(
+                            "Открыть файл",
+                            tooltip="Открыть analysis.log во внешней программе",
+                            on_click=lambda e: self.session.open_path(
+                                str(self.session.app_dir / "analysis.log")
+                            ),
+                        ),
+                    ],
+                    wrap=True,
+                ),
+                list_view,
+            ],
+            expand=True,
+            spacing=8,
+        )
+
+    async def _scroll_log_end(self, list_view: ft.ListView) -> None:
+        import asyncio
+
+        await asyncio.sleep(0.15)
+        try:
+            list_view.scroll_to(offset=-1, duration=200)
+            self.page.update()
+        except Exception:
+            pass
+
+
+def main(page: ft.Page | None = None) -> None:
+    def _run(page: ft.Page) -> None:
+        AnalizApp(page)
+
+    if page is not None:
+        _run(page)
+        return
+    ft.app(target=_run)
+
+
+if __name__ == "__main__":
+    main()

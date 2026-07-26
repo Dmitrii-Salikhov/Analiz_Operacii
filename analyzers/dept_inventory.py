@@ -190,6 +190,9 @@ def build_categories_from_codes(
     categories: List[dict] = []
     category_rows: Dict[str, int] = {}
     plan_names: List[str] = []
+    emergency_names: List[str] = []
+
+    from analyzers.emk_kind_classify import is_forced_emergency_category
 
     for i, (_, row) in enumerate(sorted_df.iterrows()):
         code = str(row["Код"]).strip()
@@ -213,7 +216,10 @@ def build_categories_from_codes(
         )
         excel_row = 4 + i
         category_rows[cat_name] = excel_row
-        plan_names.append(cat_name)
+        if is_forced_emergency_category(cat_name) or is_forced_emergency_category(ksg_name):
+            emergency_names.append(cat_name)
+        else:
+            plan_names.append(cat_name)
 
     n = len(categories)
     last_cat = 4 + n - 1 if n else 3
@@ -222,7 +228,7 @@ def build_categories_from_codes(
     summary_meta = {
         "category_rows": category_rows,
         "plan_categories": plan_names,
-        "emergency_categories": [],
+        "emergency_categories": emergency_names,
         "totals_rows": {
             "total": total_row,
             "emergency": total_row + 1,
@@ -271,7 +277,7 @@ def build_summary_cfg_draft(
         },
         "category_rows": dict(summary_meta.get("category_rows") or {}),
         "plan_categories": list(summary_meta.get("plan_categories") or []),
-        "emergency_categories": [],
+        "emergency_categories": list(summary_meta.get("emergency_categories") or []),
         "totals_rows": {
             "children": int(totals.get("children") or totals.get("patients", 0) - 2 or 0),
             "patients": int(totals.get("patients") or 0),

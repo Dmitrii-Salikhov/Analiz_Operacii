@@ -1,0 +1,62 @@
+# schemas/ui_settings.schema.yaml
+id: ui_settings
+storage: ui_settings.json
+parameters:
+  - id: summary_path
+    type: path
+    label: Путь к сводной
+  - id: department
+    type: text
+    label: Отделение
+  - id: year
+    type: int
+    label: Год
+    min: 2024
+    max: 2035
+  - id: hide_zeros
+    type: bool
+    label: Скрыть нулевые
+    default: false
+  - id: filter_enabled
+    type: bool
+    label: Фильтр дат
+    default: false
+  - id: start_date
+    type: date
+    label: Дата с
+  - id: end_date
+    type: date
+    label: Дата по
+  - id: write_weeks
+    type: bool
+    label: Писать недели
+    default: true
+  - id: write_form
+    type: bool
+    label: Писать форму 4001
+    default: true
+  - id: plan_mode
+    type: enum
+    label: План/экстренно
+    options: [template, emk]
+    default: template
+  - id: last_surg_dir
+    type: path
+    label: Последняя папка опержурналов
+  - id: last_emk_dir
+    type: path
+    label: Последняя папка ЭМК
+  - id: last_update_check
+    type: text
+    label: Последняя проверка обновлений
+  - id: last_seen_version
+    type: text
+    label: Последняя просмотренная версия
+  - id: summary_paths_by_dept
+    type: map
+    label: Пути сводных по отделениям
+  - id: theme
+    type: enum
+    label: Тема
+    options: [light, dark]
+    default: light

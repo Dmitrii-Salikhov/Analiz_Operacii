@@ -1,0 +1,146 @@
+# schemas/app_registry.yaml
+# Реестр экранов и действий — зеркало docs/INVENTORY_FLET.md
+# status: done | shell | backend
+
+version: 1
+app_id: analiz_operacii
+
+screens:
+  - id: home
+    title: Главная / Работа
+    status: done
+  - id: form14
+    title: Конструктор ФСН 14
+    status: done
+    schema: form14_constructor.schema.yaml
+  - id: preview_cat
+    title: Превью категории
+    status: done
+  - id: preview_tot
+    title: Превью итоги
+    status: done
+  - id: preview_form
+    title: Превью форма 4001
+    status: done
+  - id: emk_mismatch
+    title: Расхождения ЭМК
+    status: done
+  - id: unclassified
+    title: Не классифицировано
+    status: done
+  - id: disputed
+    title: Спорные
+    status: done
+  - id: sources
+    title: Источники
+    status: done
+  - id: log
+    title: Журнал
+    status: done
+  - id: settings
+    title: Настройки
+    status: done
+  - id: inventory_actions
+    title: Действия (меню)
+    status: shell
+
+actions:
+  - id: load_surg
+    title: Опержурнал(ы)…
+    status: done
+  - id: load_surg_folder
+    title: Опержурналы из папки…
+    status: done
+  - id: load_emk
+    title: ЭМК…
+    status: done
+  - id: choose_summary
+    title: Сводная…
+    status: done
+  - id: write_excel
+    title: Записать в Excel…
+    status: done
+  - id: open_excel
+    title: Открыть Excel
+    status: done
+  - id: restore_backup
+    title: Восстановить из бэкапа…
+    status: shell
+  - id: export_simple
+    title: Экспорт простого отчёта…
+    status: done
+  - id: create_year
+    title: Создать сводную на год…
+    status: shell
+  - id: export_uncl
+    title: Экспорт неклассифицированных…
+    status: done
+  - id: export_problems
+    title: Экспорт проблемных кодов…
+    status: done
+  - id: inventory
+    title: Инвентаризация отделения…
+    status: shell
+  - id: create_dept_summary
+    title: Создать сводную для отделения…
+    status: shell
+  - id: classify_emk_kind
+    title: План/экстр по ЭМК…
+    status: done
+  - id: form14_ctor
+    title: Конструктор ФСН 14…
+    status: done
+    screen: form14
+  - id: add_category
+    title: Добавить операцию…
+    status: shell
+  - id: delete_category
+    title: Удалить операцию…
+    status: shell
+  - id: clear_store
+    title: Очистить
+    status: done
+  - id: check_updates
+    title: Проверить обновления…
+    status: shell
+  - id: whats_new
+    title: Что нового…
+    status: shell
+  - id: about
+    title: О программе
+    status: shell
+  - id: refresh_preview
+    title: Обновить превью
+    status: done
+  - id: theme_toggle
+    title: Тема
+    status: shell
+  - id: edit_keywords
+    title: Править ключи…
+    status: shell
+  - id: assign_dispute
+    title: Назначить категорию (спорные)
+    status: shell
+
+config_files:
+  - path: config.yaml
+    schema: config_keys.schema.yaml
+  - path: ui_settings.json
+    schema: ui_settings.schema.yaml
+  - path: form14_overrides.yaml
+    schema: form14_constructor.schema.yaml
+
+priority_rules:
+  form14:
+    - override_yaml_code
+    - override_yaml_category
+    - MANUAL_LINE_BY_CATEGORY
+    - MANUAL_LINE_BY_CODE
+    - a16_class_plus_keywords
+    - fallback_line_21
+  plan_emergency:
+    - is_forced_emergency_category
+    - emk_stats
+    - config_lists_with_force_apply
+
+fallback_ui: app_desktop.py

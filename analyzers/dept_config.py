@@ -161,3 +161,90 @@ def is_lor_department(config: dict, department_name: Optional[str] = None) -> bo
 def dept_display_label(summary_key: str) -> str:
     meta = DEPT_REPORT_SOURCES.get(summary_key) or {}
     return str(meta.get("label") or summary_key)
+
+
+def dept_full_name(config: dict, summary_key: str) -> str:
+    """Полное официальное название отделения по ключу сводной."""
+    key = str(summary_key or "").strip()
+    if key == "lor":
+        return (
+            (config.get("departments") or {}).get("main")
+            or "Оториноларингологическое отделение"
+        )
+    meta = DEPT_REPORT_SOURCES.get(key) or {}
+    return str(meta.get("department") or meta.get("label") or key)
+
+
+def set_category_histology(
+    config: dict,
+    summary_key: str,
+    *,
+    histology: bool,
+    code: str = "",
+    category: str = "",
+) -> bool:
+    """
+    Ставит histology у категории в surgery_categories_by_dept[summary_key].
+    Ищет по коду A16 или по имени категории. Возвращает True, если что-то изменилось.
+    """
+    ensure_multi_dept_config(config)
+    key = str(summary_key or "").strip()
+    if not key:
+        return False
+    code = str(code or "").strip()
+    category = str(category or "").strip()
+    cats = get_surgery_categories(config, summary_key=key)
+    if not cats:
+        return False
+    changed = False
+    want = bool(histology)
+    for cat in cats:
+        match = False
+        if code and code in [str(c).strip() for c in (cat.get("codes") or [])]:
+            match = True
+        elif category and str(cat.get("category") or "").strip() == category:
+            match = True
+        if not match:
+            continue
+        if bool(cat.get("histology", False)) != want:
+            cat["histology"] = want
+            changed = True
+    if changed:
+        set_surgery_categories(config, key, cats)
+    return changed
+
+
+def sync_histology_overrides_to_config(config: dict, store: dict) -> int:
+    """
+    Для записей overrides с явным histology обновляет категории во всех отделениях.
+    Возвращает число изменённых категорий.
+    """
+    from analyzers.form14_overrides import histology_for
+
+    ensure_multi_dept_config(config)
+    by_dept = config.get("surgery_categories_by_dept") or {}
+    n = 0
+    for summary_key, cats in list(by_dept.items()):
+        if not cats:
+            continue
+        changed_any = False
+        for cat in cats:
+            cat_name = str(cat.get("category") or "").strip()
+            codes = [str(c).strip() for c in (cat.get("codes") or []) if str(c).strip()]
+            hist: Optional[bool] = None
+            for code in codes:
+                h = histology_for(store, code=code, category=cat_name)
+                if h is not None:
+                    hist = h
+                    break
+            if hist is None and cat_name:
+                hist = histology_for(store, category=cat_name)
+            if hist is None:
+                continue
+            if bool(cat.get("histology", False)) != bool(hist):
+                cat["histology"] = bool(hist)
+                changed_any = True
+                n += 1
+        if changed_any:
+            set_surgery_categories(config, str(summary_key), list(cats))
+    return n

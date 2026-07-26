@@ -1,0 +1,18 @@
+# schemas/forced_emergency.schema.yaml
+id: forced_emergency
+title: Жёсткие правила план/экстр
+backend: analyzers.emk_kind_classify.is_forced_emergency_category
+rules:
+  - id: drain_abscess
+    label: Дренирование абсцесса → экстренно
+    all_of: [дренирован, абсцесс]
+  - id: open_phlegmon_or_abscess
+    label: Вскрытие флегмоны/абсцесса → экстренно
+    all_of: [вскрытие]
+    any_of: [флегмон, абсцесс]
+normalize:
+  - lower
+  - yo_to_e
+note: >
+  «Дренирование кисты…» без «абсцесс» не затрагивается.
+  Правило применяется до ЭМК и при apply_kind / регистрации категории.

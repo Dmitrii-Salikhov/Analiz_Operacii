@@ -10,6 +10,46 @@ import pandas as pd
 from analyzers.emk_loader import normalize_hosp_type
 
 
+def is_forced_emergency_category(name: str) -> bool:
+    """
+    Жёсткое правило → всегда экстренно:
+    - вскрытие флегмоны / вскрытие абсцесса
+    - дренирование абсцесса
+    """
+    t = (name or "").lower().replace("ё", "е")
+    if "дренирован" in t and "абсцесс" in t:
+        return True
+    if "вскрытие" in t and ("флегмон" in t or "абсцесс" in t):
+        return True
+    return False
+
+
+def force_emergency_categories(
+    plan: List[str],
+    emergency: List[str],
+    *,
+    all_names: Optional[List[str]] = None,
+) -> Tuple[List[str], List[str]]:
+    """Переносит категории по правилу is_forced_emergency_category в emergency."""
+    names = list(all_names) if all_names is not None else list(plan) + list(emergency)
+    forced = [n for n in names if is_forced_emergency_category(n)]
+    if not forced:
+        return list(plan), list(emergency)
+    emerg_set = set(emergency)
+    plan_set = set(plan)
+    for n in forced:
+        emerg_set.add(n)
+        plan_set.discard(n)
+    emerg_out: List[str] = []
+    seen = set()
+    for n in list(emergency) + forced:
+        if n in emerg_set and n not in seen:
+            emerg_out.append(n)
+            seen.add(n)
+    plan_out = [n for n in plan if n in plan_set]
+    return plan_out, emerg_out
+
+
 def category_emk_counts(ops_df: pd.DataFrame) -> Dict[str, Counter]:
     """Категория → {план, экстр, нет} по полю Тип_ЭМК."""
     result: Dict[str, Counter] = defaultdict(Counter)
@@ -55,6 +95,10 @@ def classify_categories_by_emk(
     no_emk: List[str] = []
 
     for cat in names:
+        # жёсткие правила имени — сразу экстренно (ЭМК не переопределяет)
+        if is_forced_emergency_category(cat):
+            emergency.append(cat)
+            continue
         c = counts.get(cat) or Counter()
         p = int(c.get("план", 0))
         e = int(c.get("экстр", 0))
@@ -85,6 +129,8 @@ def classify_categories_by_emk(
             else:
                 plan.append(cat)
 
+    plan, emergency = force_emergency_categories(plan, emergency, all_names=names)
+
     return {
         "plan": plan,
         "emergency": emergency,
@@ -99,8 +145,36 @@ def classify_categories_by_emk(
 def apply_kind_to_summary_cfg(summary_cfg: dict, classification: dict) -> dict:
     """Обновляет plan_categories / emergency_categories в summary_cfg."""
     out = dict(summary_cfg)
-    out["plan_categories"] = list(classification.get("plan_categories") or [])
-    out["emergency_categories"] = list(classification.get("emergency_categories") or [])
+    plan = list(classification.get("plan_categories") or [])
+    emerg = list(classification.get("emergency_categories") or [])
+    all_names = list(
+        dict.fromkeys(list((summary_cfg.get("category_rows") or {}).keys()) + plan + emerg)
+    )
+    plan, emerg = force_emergency_categories(plan, emerg, all_names=all_names)
+    out["plan_categories"] = plan
+    out["emergency_categories"] = emerg
+    return out
+
+
+def apply_forced_emergency_to_summary_cfg(summary_cfg: dict) -> dict:
+    """Только жёсткие правила (без ЭМК) — для правки текущего config."""
+    out = dict(summary_cfg)
+    rows = summary_cfg.get("category_rows") or {}
+    all_names = list(rows.keys()) if rows else list(
+        (summary_cfg.get("plan_categories") or [])
+        + (summary_cfg.get("emergency_categories") or [])
+    )
+    plan = list(summary_cfg.get("plan_categories") or [])
+    emerg = list(summary_cfg.get("emergency_categories") or [])
+    for n in all_names:
+        if n not in plan and n not in emerg:
+            if is_forced_emergency_category(n):
+                emerg.append(n)
+            else:
+                plan.append(n)
+    plan, emerg = force_emergency_categories(plan, emerg, all_names=all_names)
+    out["plan_categories"] = plan
+    out["emergency_categories"] = emerg
     return out
 
 

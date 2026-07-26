@@ -244,7 +244,10 @@ def apply_category_to_config(
 
     plan = summary.setdefault("plan_categories", [])
     emerg = summary.setdefault("emergency_categories", [])
-    if spec.kind == "emergency":
+    from analyzers.emk_kind_classify import is_forced_emergency_category
+
+    as_emergency = spec.kind == "emergency" or is_forced_emergency_category(name)
+    if as_emergency:
         if name not in emerg:
             emerg.append(name)
         if name in plan:

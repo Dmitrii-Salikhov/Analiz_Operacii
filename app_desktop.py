@@ -92,6 +92,23 @@ from analyzers.updater import (
     resolve_token,
 )
 from analyzers.release_notes import format_whats_new
+from analyzers.form14_export import (
+    DEFAULT_XLSX,
+    build_mapping_rows,
+    form14_line_choices,
+    parse_line_choice,
+    write_form14_excel,
+)
+from analyzers.form14_overrides import (
+    MANUAL_COL,
+    clear_override,
+    default_path as form14_overrides_path,
+    import_overrides_from_excel,
+    load_overrides,
+    merge_store,
+    save_overrides,
+    set_override,
+)
 from analyzers.write_verify import format_verify_message, verify_write_report
 from analyzers.year_template import create_year_summary, suggest_summary_path
 
@@ -304,6 +321,7 @@ class DesktopApp:
         file_m.add_command(
             label="План/экстр по ЭМК…", command=self.classify_kinds_from_emk_dialog
         )
+        file_m.add_command(label="Конструктор ФСН 14…", command=self.form14_constructor_dialog)
         file_m.add_separator()
         file_m.add_command(label="Добавить операцию в отчёт…", command=self.add_category_dialog)
         file_m.add_command(label="Удалить операцию из отчёта…", command=self.delete_category_dialog)
@@ -1150,7 +1168,7 @@ class DesktopApp:
     def _load_log_into_ui(self):
         """При открытии — показать хвост analysis.log и прокрутить к последнему событию."""
         self.log_text.delete("1.0", tk.END)
-        lines = APP_LOG.read_lines()
+        lines = APP_LOG.read_lines(trim=True)
         if lines:
             self.log_text.insert(tk.END, "\n".join(lines) + "\n")
             self.log_text.insert(tk.END, "—" * 40 + "\n")
@@ -1776,14 +1794,38 @@ class DesktopApp:
             self.tree_preview_tot.insert("", tk.END, values=[name] + arr + [sum(arr)], tags=("total",))
             rows_tot += 1
 
-        # --- форма 4001 ---
+        # --- форма 4001 (ЛОР) или форма № 14 (прочие отделения) ---
+        from analyzers.form14_export import form14_preview_rows_from_ops
+
+        pension_age = int(self.config.get("thresholds", {}).get("pension_age", 60))
         form_cfg = self.summary_cfg.get("form_4001") or {}
-        stats = compute_form_4001(
-            month_ops,
-            self._surgery_categories(),
-            pension_age=int(self.config.get("thresholds", {}).get("pension_age", 60)),
-            form_cfg=form_cfg,
-        )
+        if form_4001_enabled(self.summary_cfg):
+            stats = compute_form_4001(
+                month_ops,
+                self._surgery_categories(),
+                pension_age=pension_age,
+                form_cfg=form_cfg,
+            )
+            preview_rows = form_4001_preview_rows(stats)
+            try:
+                self.notebook.tab(self.tab_preview_form, text="Превью: форма 4001")
+            except Exception:
+                pass
+        else:
+            from analyzers.form14_overrides import default_path as _ov_path
+            from analyzers.form14_overrides import load_overrides as _load_ov
+
+            preview_rows = form14_preview_rows_from_ops(
+                month_ops,
+                summary_key=self.summary_key,
+                pension_age=pension_age,
+                hide_zeros=True,
+                overrides=_load_ov(_ov_path(APP_DIR)),
+            )
+            try:
+                self.notebook.tab(self.tab_preview_form, text="Превью: форма № 14")
+            except Exception:
+                pass
         # Колонки как в шаблоне: 1,2,3,4,5,6,28 + S (т.4000)
         form_cols = ["c0", "line", "n", "o", "p", "q", "r", "s"]
         form_heads = [
@@ -1799,14 +1841,14 @@ class DesktopApp:
         self._configure_tree_columns(
             self.tree_form, form_cols, form_heads, widths=[280, 70, 70, 70, 70, 70, 90, 90]
         )
-        for row in form_4001_preview_rows(stats):
+        for row in preview_rows:
             name = row["name"]
             bold = name in (
                 "операции на органах уха, горла, носа",
                 "операции на органах дыхания",
                 "операции на коже и подкожной клетчатке",
                 "Всего операций",
-            )
+            ) or str(row.get("line") or "") in ("9", "15", "17")
             self.tree_form.insert(
                 "",
                 tk.END,
@@ -1830,7 +1872,7 @@ class DesktopApp:
         self.log_message(
             f"Превью: {label}, недель={[(str(s), str(e)) for s, e in weeks]}, "
             f"ops_month={len(month_ops)}, categories={rows_cat}, totals={rows_tot}, unmapped={unmapped}, "
-            f"form4001={stats}"
+            f"form_rows={len(preview_rows)}"
         )
 
     def _update_unclassified(self, ops):
@@ -3530,6 +3572,263 @@ class DesktopApp:
             messagebox.showinfo("Готово", f"Сохранено {len(out)} строк:\n{path}")
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
+
+    def form14_constructor_dialog(self):
+        """Переназначение кодов A16 → строки ФСН 14 (калибровка хирургами)."""
+        ov_path = form14_overrides_path(APP_DIR)
+        store = load_overrides(ov_path)
+        dirty = {"v": False}
+
+        top = tk.Toplevel(self.root)
+        top.title("Конструктор ФСН 14")
+        top.transient(self.root)
+        top.geometry("1100x640")
+
+        filt = tk.Frame(top)
+        filt.pack(fill=tk.X, padx=10, pady=6)
+        tk.Label(filt, text="Отделение:").pack(side=tk.LEFT)
+        dept_keys = ["все"] + [
+            k
+            for k in ("lor", "surg1", "surg2", "pedsurg", "traum")
+            if (self.config.get("surgery_categories_by_dept") or {}).get(k)
+            or (k == "lor" and self.config.get("surgery_categories"))
+        ]
+        # текущее отделение по умолчанию
+        cur = getattr(self, "summary_key", None) or "lor"
+        dept_var = StringVar(value=cur if cur in dept_keys else "все")
+        ttk.Combobox(filt, textvariable=dept_var, values=dept_keys, width=12, state="readonly").pack(
+            side=tk.LEFT, padx=4
+        )
+        only_disp = tk.BooleanVar(value=True)
+        tk.Checkbutton(filt, text="только спорные (low / стр.21)", variable=only_disp).pack(
+            side=tk.LEFT, padx=10
+        )
+        tk.Label(filt, text="Поиск:").pack(side=tk.LEFT)
+        search_var = StringVar()
+        tk.Entry(filt, textvariable=search_var, width=28).pack(side=tk.LEFT, padx=4)
+
+        cols = ("code", "name", "dept", "auto", "final", "conf", "src", "comment")
+        headers = {
+            "code": "Код",
+            "name": "Название",
+            "dept": "Отделение",
+            "auto": "Авто",
+            "final": "Итог",
+            "conf": "Уверенность",
+            "src": "Источник",
+            "comment": "Комментарий",
+        }
+        body = tk.Frame(top)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        tree = ttk.Treeview(body, columns=cols, show="headings", selectmode="extended")
+        for c in cols:
+            tree.heading(c, text=headers[c])
+            w = 90 if c in ("code", "auto", "final", "conf") else (120 if c == "dept" else 200)
+            if c == "src":
+                w = 160
+            if c == "comment":
+                w = 140
+            tree.column(c, width=w, stretch=(c in ("name", "src", "comment")))
+        sy = ttk.Scrollbar(body, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=sy.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sy.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # кэш строк iid → row dict
+        row_by_iid: dict = {}
+
+        def refresh_table(*_a):
+            tree.delete(*tree.get_children())
+            row_by_iid.clear()
+            keys = None if dept_var.get() == "все" else [dept_var.get()]
+            rows = build_mapping_rows(self.config, overrides=store, dept_keys=keys)
+            q = (search_var.get() or "").strip().lower()
+            for r in rows:
+                final = str(r.get("Строка_ФСН14") or "")
+                conf = str(r.get("Уверенность") or "")
+                if only_disp.get() and not (conf == "low" or final == "21"):
+                    # показать также уже с override
+                    if not r.get("Строка_ФСН14_ручная"):
+                        continue
+                code = str(r.get("Код") or "")
+                name = str(r.get("Наименование_КСГ") or r.get("Категория") or "")
+                if q and q not in code.lower() and q not in name.lower():
+                    continue
+                iid = f"{r.get('summary_key')}|{code}|{r.get('Категория')}"
+                # уникальность iid
+                base_iid = iid
+                n = 1
+                while iid in row_by_iid:
+                    n += 1
+                    iid = f"{base_iid}#{n}"
+                row_by_iid[iid] = r
+                tree.insert(
+                    "",
+                    tk.END,
+                    iid=iid,
+                    values=(
+                        code,
+                        name[:80],
+                        r.get("Отделение") or "",
+                        r.get("Авто") or "",
+                        final,
+                        conf,
+                        r.get("Правило") or "",
+                        r.get("Комментарий") or "",
+                    ),
+                )
+            status.set(f"Строк: {len(row_by_iid)} | overrides в памяти: "
+                       f"{len(store.get('by_code') or {}) + len(store.get('by_category') or {})}"
+                       f"{' *' if dirty['v'] else ''}")
+
+        status = StringVar(value="")
+        tk.Label(top, textvariable=status, anchor="w").pack(fill=tk.X, padx=10)
+
+        edit = tk.Frame(top)
+        edit.pack(fill=tk.X, padx=10, pady=6)
+        tk.Label(edit, text="Строка ФСН 14:").pack(side=tk.LEFT)
+        line_choices = form14_line_choices()
+        line_var = StringVar(value=line_choices[0] if line_choices else "")
+        ttk.Combobox(edit, textvariable=line_var, values=line_choices, width=56, state="readonly").pack(
+            side=tk.LEFT, padx=4
+        )
+        tk.Label(edit, text="Коммент.:").pack(side=tk.LEFT, padx=(8, 0))
+        comment_var = StringVar()
+        tk.Entry(edit, textvariable=comment_var, width=28).pack(side=tk.LEFT, padx=4)
+
+        def on_select(_e=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            r = row_by_iid.get(sel[0]) or {}
+            cur_line = str(r.get("Строка_ФСН14_ручная") or r.get("Строка_ФСН14") or "")
+            for ch in line_choices:
+                if ch.startswith(cur_line + " —") or ch.startswith(cur_line + " -"):
+                    line_var.set(ch)
+                    break
+            comment_var.set(str(r.get("Комментарий") or ""))
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        def assign():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Конструктор", "Выберите строку(и) в таблице", parent=top)
+                return
+            line = parse_line_choice(line_var.get())
+            if not line:
+                messagebox.showwarning("Конструктор", "Выберите строку ФСН 14", parent=top)
+                return
+            comment = comment_var.get().strip()
+            nonlocal_store = store
+            for iid in sel:
+                r = row_by_iid.get(iid) or {}
+                code = str(r.get("Код") or "").strip()
+                cat = str(r.get("Категория") or "").strip()
+                try:
+                    updated = set_override(
+                        nonlocal_store,
+                        line=line,
+                        code=code,
+                        category=cat if not code else "",
+                        comment=comment,
+                        by="конструктор",
+                    )
+                    nonlocal_store.clear()
+                    nonlocal_store.update(updated)
+                except ValueError as e:
+                    messagebox.showerror("Конструктор", str(e), parent=top)
+                    return
+            dirty["v"] = True
+            refresh_table()
+
+        def reset_ov():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Конструктор", "Выберите строку(и)", parent=top)
+                return
+            for iid in sel:
+                r = row_by_iid.get(iid) or {}
+                code = str(r.get("Код") or "").strip()
+                cat = str(r.get("Категория") or "").strip()
+                updated = clear_override(store, code=code, category=cat)
+                store.clear()
+                store.update(updated)
+            dirty["v"] = True
+            refresh_table()
+
+        def save():
+            save_overrides(store, ov_path)
+            dirty["v"] = False
+            self.log_message(f"ФСН 14 overrides: {ov_path}")
+            refresh_table()
+            messagebox.showinfo("Сохранено", f"Калибровка записана:\n{ov_path}", parent=top)
+
+        def export_xlsx():
+            path = filedialog.asksaveasfilename(
+                parent=top,
+                title="Экспорт маппинга ФСН 14",
+                initialdir=str(APP_DIR),
+                initialfile=DEFAULT_XLSX,
+                defaultextension=".xlsx",
+                filetypes=[("Excel", "*.xlsx")],
+            )
+            if not path:
+                return
+            try:
+                write_form14_excel(path, self.config, overrides=store)
+                self.log_message(f"Экспорт ФСН 14: {path}")
+                messagebox.showinfo("Готово", f"Сохранено:\n{path}", parent=top)
+            except Exception as e:
+                self.log_message(traceback.format_exc(), level="ERROR")
+                messagebox.showerror("Ошибка", str(e), parent=top)
+
+        def import_xlsx():
+            path = filedialog.askopenfilename(
+                parent=top,
+                title="Импорт калибровки из Excel",
+                initialdir=str(APP_DIR),
+                filetypes=[("Excel", "*.xlsx")],
+            )
+            if not path:
+                return
+            try:
+                frag, n = import_overrides_from_excel(path)
+                if n == 0:
+                    messagebox.showwarning(
+                        "Импорт",
+                        f"Не найдено заполненных «{MANUAL_COL}».\n"
+                        "Заполните колонку на листе «Все коды» или «Спорные_low_и_21».",
+                        parent=top,
+                    )
+                    return
+                merged = merge_store(store, frag)
+                store.clear()
+                store.update(merged)
+                dirty["v"] = True
+                refresh_table()
+                messagebox.showinfo(
+                    "Импорт",
+                    f"Прочитано назначений: {n}\nНажмите «Сохранить», чтобы записать YAML.",
+                    parent=top,
+                )
+            except Exception as e:
+                self.log_message(traceback.format_exc(), level="ERROR")
+                messagebox.showerror("Ошибка", str(e), parent=top)
+
+        bf = tk.Frame(top)
+        bf.pack(pady=8)
+        _btn(bf, "Назначить", assign, side=tk.LEFT, padx=3)
+        _btn(bf, "Сбросить", reset_ov, side=tk.LEFT, padx=3)
+        _btn(bf, "Сохранить", save, side=tk.LEFT, padx=3)
+        _btn(bf, "Экспорт Excel…", export_xlsx, side=tk.LEFT, padx=3)
+        _btn(bf, "Импорт Excel…", import_xlsx, side=tk.LEFT, padx=3)
+        _btn(bf, "Закрыть", top.destroy, side=tk.LEFT, padx=3)
+
+        dept_var.trace_add("write", lambda *_: refresh_table())
+        only_disp.trace_add("write", lambda *_: refresh_table())
+        search_var.trace_add("write", lambda *_: refresh_table())
+        refresh_table()
 
 
 if __name__ == "__main__":

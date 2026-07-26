@@ -9,7 +9,7 @@ import pandas as pd
 APP = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP))
 
-from analyzers.emk_kind_classify import classify_categories_by_emk
+from analyzers.emk_kind_classify import classify_categories_by_emk, is_forced_emergency_category
 from analyzers.dept_inventory import category_display_name, shorten_category_label, strip_service_code_prefix
 
 
@@ -55,3 +55,31 @@ def test_classify_clear_and_disputed():
     assert "Без связи" in kind["no_emk"]
     assert len(kind["disputed"]) == 1
     assert kind["disputed"][0]["Категория"] == "Смешанная"
+
+
+def test_forced_phlegmon_abscess_emergency():
+    assert is_forced_emergency_category("Вскрытие и дренирование флегмоны (абсцесса)")
+    assert is_forced_emergency_category("Вскрытие флегмоны (абсцесса) стопы (голени)")
+    assert is_forced_emergency_category("Вскрытие и дренирование внутрибрюшной флегмоны, абсцесса")
+    assert is_forced_emergency_category("Дренирование абсцесса печени")
+    assert is_forced_emergency_category("Дренирование абсцессов брюшной полости под контролем…")
+    assert not is_forced_emergency_category("Флегмона шеи")
+    assert not is_forced_emergency_category("Дренирование кисты печени")
+
+    ops = pd.DataFrame(
+        [
+            {"Категория": "Вскрытие флегмоны (абсцесса) стопы (голени)", "Тип_ЭМК": "плановая"},
+            {"Категория": "Дренирование абсцесса печени", "Тип_ЭМК": "плановая"},
+        ]
+    )
+    kind = classify_categories_by_emk(
+        ops,
+        category_names=[
+            "Вскрытие флегмоны (абсцесса) стопы (голени)",
+            "Дренирование абсцесса печени",
+            "Геморрой",
+        ],
+    )
+    assert "Вскрытие флегмоны (абсцесса) стопы (голени)" in kind["emergency"]
+    assert "Дренирование абсцесса печени" in kind["emergency"]
+    assert "Геморрой" in kind["plan"]

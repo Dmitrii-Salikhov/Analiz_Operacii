@@ -58,6 +58,8 @@ def test_form_4001_disabled_for_surgery():
 
 
 def test_inventory_one_code_one_row():
+    from analyzers.emk_kind_classify import is_forced_emergency_category
+
     reports = APP / "Отчеты других отделений"
     path = reports / "дет хир.xlsx"
     if not path.exists():
@@ -67,5 +69,10 @@ def test_inventory_one_code_one_row():
     cats, rows, meta = build_categories_from_codes(table)
     assert len(cats) == len(table)
     assert len(rows) == len(cats)
-    assert len(meta.get("plan_categories") or []) == len(cats)
-    assert not meta.get("emergency_categories")
+    plan = meta.get("plan_categories") or []
+    emerg = meta.get("emergency_categories") or []
+    assert len(plan) + len(emerg) == len(cats)
+    for name in emerg:
+        assert is_forced_emergency_category(name)
+    for name in plan:
+        assert not is_forced_emergency_category(name)
