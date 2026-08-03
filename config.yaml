@@ -15,6 +15,7 @@ departments:
 thresholds:
   max_bed_days: 7
   pension_age: 60
+  long_op_hours: 4
 summary: &id001
   default_path: Операции сводная 2026.xlsx
   backup_keep: 20

@@ -5,7 +5,7 @@ sections:
   - id: departments
     keys: [main, list]
   - id: thresholds
-    keys: [max_bed_days, pension_age]
+    keys: [max_bed_days, pension_age, long_op_hours]
   - id: updates
     keys:
       - enabled

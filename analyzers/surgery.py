@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -11,6 +11,72 @@ from analyzers.io_utils import find_column
 from analyzers.ksg_catalog import get_catalog
 
 ADENOTOMY_CODES_DEFAULT = {"A16.08.002.001"}
+
+
+def parse_op_datetime(date_val: Any, time_val: Any = None) -> Optional[pd.Timestamp]:
+    """Дата + время операции → Timestamp (DD.MM.YYYY / ISO + HH:MM)."""
+    if date_val is None or (isinstance(date_val, float) and pd.isna(date_val)):
+        return None
+    if isinstance(date_val, pd.Timestamp):
+        base = date_val.to_pydatetime()
+    elif isinstance(date_val, datetime):
+        base = date_val
+    else:
+        s = str(date_val).strip()
+        if not s or s.lower() in ("nan", "none", "nat"):
+            return None
+        # отрезать время, если дата уже с временем
+        if " " in s and re.match(r"^\d{1,2}[./]\d{1,2}[./]\d{2,4}\s+\d", s):
+            s_date, s_time = s.split(None, 1)
+            if time_val is None or (isinstance(time_val, float) and pd.isna(time_val)):
+                time_val = s_time
+            s = s_date
+        base_ts = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        if pd.isna(base_ts):
+            return None
+        base = base_ts.to_pydatetime()
+
+    hour, minute, second = 0, 0, 0
+    if time_val is not None and not (isinstance(time_val, float) and pd.isna(time_val)):
+        if isinstance(time_val, datetime):
+            hour, minute, second = time_val.hour, time_val.minute, time_val.second
+        elif isinstance(time_val, pd.Timestamp):
+            hour, minute, second = time_val.hour, time_val.minute, time_val.second
+        else:
+            ts = str(time_val).strip()
+            if ts and ts.lower() not in ("nan", "none"):
+                # "12:15", "12:15:00", datetime-like
+                m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?", ts)
+                if m:
+                    hour = int(m.group(1))
+                    minute = int(m.group(2))
+                    second = int(m.group(3) or 0)
+                else:
+                    t_parsed = pd.to_datetime(ts, errors="coerce")
+                    if pd.notna(t_parsed):
+                        hour, minute, second = t_parsed.hour, t_parsed.minute, t_parsed.second
+    try:
+        return pd.Timestamp(
+            year=base.year,
+            month=base.month,
+            day=base.day,
+            hour=hour,
+            minute=minute,
+            second=second,
+        )
+    except (ValueError, OverflowError):
+        return None
+
+
+def duration_hours(start: Any, end: Any) -> Optional[float]:
+    """Длительность в часах; None если нет валидных начала/конца."""
+    if start is None or end is None or pd.isna(start) or pd.isna(end):
+        return None
+    try:
+        delta = pd.Timestamp(end) - pd.Timestamp(start)
+        return float(delta.total_seconds()) / 3600.0
+    except Exception:
+        return None
 
 
 def resolve_emk_hosp_type(episodes: List[dict], date_op) -> Optional[str]:
@@ -236,6 +302,14 @@ class SurgeryAnalyzer:
         date_start_col = find_column(self.df, ["дата", "начала"])
         if not date_start_col:
             raise KeyError("Не найдена колонка с датой начала операции")
+        self.date_start_col = date_start_col
+        self.date_end_col = find_column(self.df, ["дата", "окончания"])
+        self.time_start_col = find_column(self.df, ["время", "начала"])
+        self.time_end_col = find_column(self.df, ["время", "окончания"])
+        self.patient_col = find_column(self.df, ["фамилия", "пациент"]) or find_column(
+            self.df, ["фамилия", "имя", "отчество"]
+        )
+
         self.df["Дата операции"] = pd.to_datetime(self.df[date_start_col], dayfirst=True, errors="coerce")
 
         birth_col = find_column(self.df, ["дата", "рождения"])
@@ -375,9 +449,27 @@ class SurgeryAnalyzer:
         ksg_name = self.ksg.name_for(code) if code else ""
         ksg_groups = self.ksg.ksg_for(code) if code else ""
         ksg_hint = self.ksg.hint_for(code) if code and cat_name == "Не классифицировано" else ""
+
+        t_start_raw = row.get(self.time_start_col) if self.time_start_col else None
+        t_end_raw = row.get(self.time_end_col) if self.time_end_col else None
+        d_end_raw = row.get(self.date_end_col) if self.date_end_col else row.get(self.date_start_col)
+        start_dt = parse_op_datetime(row.get(self.date_start_col), t_start_raw)
+        end_dt = parse_op_datetime(d_end_raw, t_end_raw)
+        hours = duration_hours(start_dt, end_dt)
+
+        patient = ""
+        if self.patient_col and pd.notna(row.get(self.patient_col)):
+            patient = str(row.get(self.patient_col) or "").strip()
+            if patient.lower() in ("nan", "none"):
+                patient = ""
+
         return {
             "Дата": row["Дата операции"],
+            "Начало": start_dt,
+            "Конец": end_dt,
+            "Длительность_ч": hours,
             "КВС": row.get("№ истории"),
+            "Пациент": patient,
             "Дата рождения": row.get("Дата рождения"),
             "Возраст": row.get("Возраст"),
             "Отделение": row.get("Отделение госпитализации"),

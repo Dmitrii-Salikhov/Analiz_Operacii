@@ -37,6 +37,11 @@ from analyzers.form14_export import form14_preview_rows_from_ops
 from analyzers.form14_overrides import default_path as form14_overrides_path
 from analyzers.form14_overrides import load_overrides
 from analyzers.io_utils import OperationsStore, read_table
+from analyzers.op_quality_checks import (
+    find_long_operations,
+    find_missing_or_table,
+    long_op_hours_from_config,
+)
 from analyzers.problem_codes import build_problem_codes_table
 from analyzers.summary_writer import MONTH_RU, SummaryWriter, compute_month_weeks, read_sheet_weeks
 from analyzers.surgery import SurgeryAnalyzer, build_summary_tables
@@ -83,6 +88,8 @@ class AppSession:
         self.unclassified_rows: List[dict] = []
         self.disputed_rows: List[dict] = []
         self.emk_mismatch_rows: List[dict] = []
+        self.long_op_rows: List[dict] = []
+        self.missing_table_rows: List[dict] = []
         self.kpi: Dict[str, str] = {
             "ops": "—",
             "patients": "—",
@@ -91,6 +98,7 @@ class AppSession:
             "period": "—",
             "files": "0 / нет",
             "diff": "—",
+            "checks": "—",
         }
         self.status = "Готов к работе"
         self.month_label_to_num: Dict[str, int] = {}
@@ -333,6 +341,8 @@ class AppSession:
         self.unclassified_rows = []
         self.disputed_rows = []
         self.emk_mismatch_rows = []
+        self.long_op_rows = []
+        self.missing_table_rows = []
         for k in self.kpi:
             self.kpi[k] = "—" if k != "files" else "0 / нет"
         self.refresh_files_kpi()
@@ -371,6 +381,9 @@ class AppSession:
         ops = self.get_view_ops()
         if ops.empty:
             self.status = "Нет операций"
+            self.long_op_rows = []
+            self.missing_table_rows = []
+            self.kpi["checks"] = "—"
             return
         cat_table, totals_df, weeks = build_summary_tables(
             ops, self.summary_cfg, self._surgery_categories()
@@ -380,6 +393,7 @@ class AppSession:
         self.build_preview()
         self._fill_unclassified(ops)
         self._fill_disputed(ops)
+        self._fill_quality_checks(ops)
         self._update_kpis(ops, totals_df)
         self.refresh_emk_compare(select=False)
         self.status = f"Готово: {len(ops)} операций, {len(weeks)} нед."
@@ -513,6 +527,21 @@ class AppSession:
                 }
             )
         self.disputed_rows = rows
+
+    def _fill_quality_checks(self, ops: pd.DataFrame) -> None:
+        hours = long_op_hours_from_config(self.config)
+        self.long_op_rows = find_long_operations(ops, max_hours=hours)
+        self.missing_table_rows = find_missing_or_table(ops)
+        n = len(self.long_op_rows) + len(self.missing_table_rows)
+        self.kpi["checks"] = str(n)
+
+    def long_op_hours(self) -> float:
+        return long_op_hours_from_config(self.config)
+
+    def set_long_op_hours(self, value: float) -> None:
+        thr = self.config.setdefault("thresholds", {})
+        thr["long_op_hours"] = float(value)
+        save_config(self.config, self.app_dir / "config.yaml")
 
     def _update_kpis(self, ops: pd.DataFrame, totals_df) -> None:
         self.kpi["ops"] = str(len(ops))
@@ -653,6 +682,23 @@ class AppSession:
         else:
             df.to_csv(out_path, index=False, encoding="utf-8-sig")
         return len(df)
+
+    def export_quality_checks(self, out_path: str) -> int:
+        long_df = pd.DataFrame(self.long_op_rows)
+        miss_df = pd.DataFrame(self.missing_table_rows)
+        if out_path.lower().endswith(".xlsx"):
+            with pd.ExcelWriter(out_path, engine="openpyxl") as w:
+                long_df.to_excel(w, sheet_name="Длительные", index=False)
+                miss_df.to_excel(w, sheet_name="Без_стола", index=False)
+        else:
+            pd.concat(
+                [
+                    long_df.assign(Тип="длительная") if not long_df.empty else long_df,
+                    miss_df.assign(Тип="без_стола") if not miss_df.empty else miss_df,
+                ],
+                ignore_index=True,
+            ).to_csv(out_path, index=False, encoding="utf-8-sig")
+        return len(self.long_op_rows) + len(self.missing_table_rows)
 
     def classify_kinds_from_emk(self) -> dict:
         if self.df_emk is None:

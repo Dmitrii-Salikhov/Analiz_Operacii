@@ -109,6 +109,11 @@ from analyzers.form14_overrides import (
     save_overrides,
     set_override,
 )
+from analyzers.op_quality_checks import (
+    find_long_operations,
+    find_missing_or_table,
+    long_op_hours_from_config,
+)
 from analyzers.write_verify import format_verify_message, verify_write_report
 from analyzers.year_template import create_year_summary, suggest_summary_path
 
@@ -723,6 +728,10 @@ class DesktopApp:
         tk.Radiobutton(
             r2, text="Сверка с ЭМК", variable=self.plan_mode, value="emk", command=self.on_emk_mode
         ).pack(side=tk.LEFT, padx=8)
+        tk.Label(r2, text="Длительная опер., ч:").pack(side=tk.LEFT, padx=(16, 2))
+        self.long_op_hours_var = StringVar(value=f"{long_op_hours_from_config(self.config):g}")
+        tk.Entry(r2, textvariable=self.long_op_hours_var, width=5).pack(side=tk.LEFT)
+        _btn(r2, "OK", self._apply_long_op_hours, side=tk.LEFT, padx=4)
 
         r3 = tk.Frame(opts)
         r3.pack(fill=tk.X, pady=2)
@@ -766,6 +775,7 @@ class DesktopApp:
         self.tab_emk = tk.Frame(self.notebook)
         self.tab_uncl = tk.Frame(self.notebook)
         self.tab_dispute = tk.Frame(self.notebook)
+        self.tab_checks = tk.Frame(self.notebook)
         self.tab_log = tk.Frame(self.notebook)
         self.notebook.add(self.tab_preview_cat, text="Превью: категории")
         self.notebook.add(self.tab_preview_tot, text="Превью: итоги")
@@ -773,6 +783,7 @@ class DesktopApp:
         self.notebook.add(self.tab_emk, text="Расхождения ЭМК")
         self.notebook.add(self.tab_uncl, text="Не классифицировано")
         self.notebook.add(self.tab_dispute, text="Спорные")
+        self.notebook.add(self.tab_checks, text="Проверки")
         self.notebook.add(self.tab_log, text="Журнал")
 
         pbtns = tk.Frame(self.tab_preview_cat)
@@ -847,6 +858,33 @@ class DesktopApp:
         self.tree_dispute.configure(yscrollcommand=dvs.set)
         self.tree_dispute.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         dvs.pack(side=tk.RIGHT, fill=tk.Y)
+
+        chk_top = tk.Frame(self.tab_checks)
+        chk_top.pack(fill=tk.X, pady=2)
+        _btn(chk_top, "Экспорт…", self.export_quality_checks, side=tk.LEFT, padx=2)
+        self.checks_info = StringVar(value="Длительные операции и отсутствие опер. стола")
+        tk.Label(self.tab_checks, textvariable=self.checks_info, anchor="w", fg="#555").pack(
+            fill=tk.X, padx=2
+        )
+        chk_paned = ttk.Panedwindow(self.tab_checks, orient=tk.VERTICAL)
+        chk_paned.pack(fill=tk.BOTH, expand=True)
+        long_fr = tk.LabelFrame(chk_paned, text="Длительные операции")
+        miss_fr = tk.LabelFrame(chk_paned, text="Не занесены на опер. стол")
+        chk_paned.add(long_fr, weight=1)
+        chk_paned.add(miss_fr, weight=1)
+        chk_cols = ("КВС", "Пациент", "Хирург", "Услуга", "Длит.", "Причина")
+        chk_widths = (90, 160, 140, 280, 60, 140)
+        self.tree_long_ops = ttk.Treeview(long_fr, columns=chk_cols, show="headings")
+        self.tree_miss_table = ttk.Treeview(miss_fr, columns=chk_cols, show="headings")
+        for tree in (self.tree_long_ops, self.tree_miss_table):
+            for c, w in zip(chk_cols, chk_widths):
+                tree.heading(c, text=c)
+                tree.column(c, width=w, anchor="w")
+            parent = tree.master
+            vs_chk = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
+            tree.configure(yscrollcommand=vs_chk.set)
+            tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            vs_chk.pack(side=tk.RIGHT, fill=tk.Y)
 
         log_top = tk.Frame(self.tab_log)
         log_top.pack(fill=tk.X, pady=2)
@@ -1295,6 +1333,10 @@ class DesktopApp:
                 self.notebook.tab(self.tab_uncl, text="Не классифицировано")
             if hasattr(self, "tab_dispute"):
                 self.notebook.tab(self.tab_dispute, text="Спорные")
+            if hasattr(self, "tab_checks"):
+                self.notebook.tab(self.tab_checks, text="Проверки")
+                if hasattr(self, "checks_info"):
+                    self.checks_info.set("Длительные операции и отсутствие опер. стола")
             self.log_message("Накопитель очищен")
             self.status_var.set("Очищено")
 
@@ -1306,6 +1348,8 @@ class DesktopApp:
             getattr(self, "tree_emk", None),
             getattr(self, "tree_uncl", None),
             getattr(self, "tree_dispute", None),
+            getattr(self, "tree_long_ops", None),
+            getattr(self, "tree_miss_table", None),
         ):
             if tree is None:
                 continue
@@ -1521,6 +1565,7 @@ class DesktopApp:
             self.refresh_preview()
             self._update_unclassified(ops)
             self._update_disputed(ops)
+            self._update_quality_checks(ops)
             self._update_kpis(ops, totals_df)
             self._maybe_update_emk_kpi(ops)
             self.status_var.set(f"Готово: {len(ops)} операций, {len(weeks)} нед.")
@@ -1922,6 +1967,80 @@ class DesktopApp:
                     r.get("Спорные_категории", ""),
                 ),
             )
+
+    def _apply_long_op_hours(self):
+        try:
+            hours = float(str(self.long_op_hours_var.get() or "4").replace(",", "."))
+        except ValueError:
+            messagebox.showerror("Порог", "Укажите число часов (например 4)")
+            return
+        thr = self.config.setdefault("thresholds", {})
+        thr["long_op_hours"] = hours
+        save_config(self.config, APP_DIR / "config.yaml")
+        self.long_op_hours_var.set(f"{hours:g}")
+        if not self.store.ops.empty:
+            self.run_analysis()
+        else:
+            self.status_var.set(f"Порог длительности: > {hours:g} ч")
+
+    def _update_quality_checks(self, ops):
+        for tree in (getattr(self, "tree_long_ops", None), getattr(self, "tree_miss_table", None)):
+            if tree is None:
+                continue
+            for item in tree.get_children():
+                tree.delete(item)
+        hours = long_op_hours_from_config(self.config)
+        long_rows = find_long_operations(ops, max_hours=hours)
+        miss_rows = find_missing_or_table(ops)
+        n = len(long_rows) + len(miss_rows)
+        if hasattr(self, "tab_checks"):
+            self.notebook.tab(self.tab_checks, text=f"Проверки ({n})")
+        if hasattr(self, "checks_info"):
+            self.checks_info.set(
+                f"Длительные (> {hours:g} ч): {len(long_rows)} | без опер. стола: {len(miss_rows)}"
+            )
+
+        def fill(tree, rows):
+            if tree is None:
+                return
+            for r in rows:
+                tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        r.get("КВС", ""),
+                        r.get("Пациент", ""),
+                        r.get("Хирург", ""),
+                        str(r.get("Услуга") or "")[:80],
+                        r.get("Длительность", ""),
+                        r.get("Причина", ""),
+                    ),
+                )
+
+        fill(getattr(self, "tree_long_ops", None), long_rows)
+        fill(getattr(self, "tree_miss_table", None), miss_rows)
+        self._quality_long_rows = long_rows
+        self._quality_miss_rows = miss_rows
+
+    def export_quality_checks(self):
+        long_rows = getattr(self, "_quality_long_rows", []) or []
+        miss_rows = getattr(self, "_quality_miss_rows", []) or []
+        if not long_rows and not miss_rows:
+            messagebox.showinfo("Экспорт", "Нет замечаний для экспорта — сначала «Обновить превью»")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile="проверки_операций.xlsx",
+            title="Экспорт проверок",
+        )
+        if not path:
+            return
+        with pd.ExcelWriter(path, engine="openpyxl") as w:
+            pd.DataFrame(long_rows).to_excel(w, sheet_name="Длительные", index=False)
+            pd.DataFrame(miss_rows).to_excel(w, sheet_name="Без_стола", index=False)
+        self.log_message(f"Экспорт проверок: {len(long_rows)+len(miss_rows)} → {path}")
+        messagebox.showinfo("Экспорт", f"Сохранено: {path}")
 
     def update_summary(self):
         """Один диалог записи: галочки «Недели» и «Форма 4001»."""

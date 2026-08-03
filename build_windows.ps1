@@ -1,5 +1,6 @@
 # Сборка Windows: папка dist/AnalizOperacii/ (onedir), не один файл.
 # Запуск: pwsh ./build_windows.ps1
+# Точка входа — Tk UI (app_desktop.py). Flet: отдельно python run_flet.py.
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -10,7 +11,10 @@ $entry = "app_desktop.py"
 $addData = @(
     "VERSION;.",
     "config.yaml;.",
-    "requirements.txt;."
+    "requirements.txt;.",
+    "RELEASE_NOTES.md;.",
+    "form14_overrides.yaml;.",
+    "schemas;schemas"
 )
 
 if (Test-Path "KSGoperacii.csv") {
@@ -26,15 +30,7 @@ $args = @(
     "--windowed",
     "--onedir",
     "--name", $name,
-    "--hidden-import", "analyzers",
-    "--hidden-import", "analyzers.updater",
-    "--hidden-import", "analyzers.surgery",
-    "--hidden-import", "analyzers.summary_writer",
-    "--hidden-import", "analyzers.summary_layout",
-    "--hidden-import", "analyzers.category_registry",
-    "--hidden-import", "analyzers.release_notes",
-    "--hidden-import", "analyzers.form_4001",
-    "--hidden-import", "analyzers.io_utils",
+    "--collect-submodules", "analyzers",
     "--hidden-import", "yaml",
     "--hidden-import", "openpyxl",
     "--hidden-import", "pandas",
@@ -56,6 +52,13 @@ pyinstaller @args
 $out = "dist\$name"
 Copy-Item -Force "VERSION" "$out\VERSION"
 Copy-Item -Force "config.yaml" "$out\config.yaml"
+Copy-Item -Force "RELEASE_NOTES.md" "$out\RELEASE_NOTES.md"
+Copy-Item -Force "form14_overrides.yaml" "$out\form14_overrides.yaml"
+Copy-Item -Force "requirements.txt" "$out\requirements.txt"
+if (Test-Path "schemas") {
+    if (Test-Path "$out\schemas") { Remove-Item -Recurse -Force "$out\schemas" }
+    Copy-Item -Recurse -Force "schemas" "$out\schemas"
+}
 if (Test-Path "KSGoperacii.csv") {
     Copy-Item -Force "KSGoperacii.csv" "$out\KSGoperacii.csv"
 }

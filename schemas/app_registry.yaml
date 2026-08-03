@@ -31,6 +31,9 @@ screens:
   - id: disputed
     title: Спорные
     status: done
+  - id: checks
+    title: Проверки журнала
+    status: done
   - id: sources
     title: Источники
     status: done

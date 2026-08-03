@@ -15,6 +15,7 @@ from ui_flet.session import AppSession
 NAV = [
     ("work", "Работа", ft.Icons.HOME),
     ("preview", "Превью", ft.Icons.TABLE_CHART),
+    ("checks", "Проверки", ft.Icons.FACT_CHECK),
     ("emk", "ЭМК", ft.Icons.COMPARE_ARROWS),
     ("uncl", "Не класс.", ft.Icons.HELP_OUTLINE),
     ("disp", "Спорные", ft.Icons.WARNING_AMBER),
@@ -25,6 +26,7 @@ NAV = [
 NAV_TIP = {
     "work": "Источники, настройки и сводка по загруженным данным",
     "preview": "Таблица по неделям: категории, итоги, форма 4001",
+    "checks": "Длительные операции и отсутствие занесения на опер. стол",
     "emk": "Сверка план/экстренные с выгрузкой ЭМК",
     "uncl": "Операции без категории в рубрикаторе",
     "disp": "Операции с несколькими кандидатами категории",
@@ -177,6 +179,7 @@ class AnalizApp:
             ("Период", k["period"]),
             ("Файлы / ЭМК", k["files"]),
             ("Расхождений ЭМК", k["diff"]),
+            ("Проверок", k.get("checks", "—")),
         ]
 
         def card(title: str, value: str) -> ft.Control:
@@ -247,6 +250,7 @@ class AnalizApp:
         builders = {
             "work": self._screen_work,
             "preview": self._screen_preview,
+            "checks": self._screen_checks,
             "emk": self._screen_emk,
             "uncl": self._screen_uncl,
             "disp": self._screen_disp,
@@ -427,6 +431,13 @@ class AnalizApp:
         year_tf = ft.TextField(label="Год", value=str(s.year), width=90, dense=True)
         start_tf = ft.TextField(label="Дата с", value=s.start_date, width=120, dense=True)
         end_tf = ft.TextField(label="Дата по", value=s.end_date, width=120, dense=True)
+        long_tf = ft.TextField(
+            label="Длительная опер., ч",
+            value=f"{s.long_op_hours():g}",
+            width=140,
+            dense=True,
+            tooltip="Операции дольше этого порога попадают в «Проверки»",
+        )
         sum_tf = ft.TextField(label="Сводная", value=s.summary_path, expand=True, dense=True)
         filt = ft.Switch(label="Фильтр дат", value=s.filter_enabled)
         hide = ft.Switch(label="Скрыть нули", value=s.hide_zeros)
@@ -462,6 +473,10 @@ class AnalizApp:
             s.plan_mode = plan.value or "template"
             s.write_weeks = bool(weeks_sw.value)
             s.write_form = bool(form_sw.value) if s.form4001_enabled() else False
+            try:
+                s.set_long_op_hours(float(str(long_tf.value or "4").replace(",", ".")))
+            except ValueError:
+                pass
             s.persist()
             if not s.store.ops.empty:
                 s.run_analysis()
@@ -489,7 +504,7 @@ class AnalizApp:
                     size=13,
                     color=ft.Colors.ON_SURFACE_VARIANT,
                 ),
-                ft.Row([year_tf, start_tf, end_tf, filt, hide, plan], wrap=True),
+                ft.Row([year_tf, start_tf, end_tf, long_tf, filt, hide, plan], wrap=True),
                 ft.Row(
                     [
                         sum_tf,
@@ -728,6 +743,79 @@ class AnalizApp:
             for r in rows
         ]
         return self._data_table(headers, data, numeric_from=2)
+
+    def _screen_checks(self) -> ft.Control:
+        s = self.session
+        long_rows = s.long_op_rows
+        miss_rows = s.missing_table_rows
+        thr = s.long_op_hours()
+
+        def table_block(title: str, rows: list) -> ft.Control:
+            headers = ["КВС", "Пациент", "Хирург", "Услуга", "Длит., ч", "Причина"]
+            data = [
+                [
+                    r.get("КВС", ""),
+                    r.get("Пациент", ""),
+                    r.get("Хирург", ""),
+                    (str(r.get("Услуга") or "")[:70]),
+                    r.get("Длительность", "") if title.startswith("Длительн") else "",
+                    r.get("Причина", ""),
+                ]
+                for r in rows[:500]
+            ]
+            body = (
+                self._data_table(headers, data)
+                if data
+                else ft.Text("Нет замечаний", color=ft.Colors.ON_SURFACE_VARIANT)
+            )
+            return ft.Column(
+                [
+                    ft.Text(f"{title}: {len(rows)}", size=16, weight=ft.FontWeight.BOLD),
+                    body,
+                ],
+                spacing=6,
+            )
+
+        async def exp(_e):
+            path = await self.file_picker.save_file(
+                dialog_title="Экспорт проверок",
+                file_name="проверки_операций.xlsx",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["xlsx"],
+            )
+            if not path:
+                path = str(self.session.app_dir / "проверки_операций.xlsx")
+            n = self.session.export_quality_checks(path)
+            self._snack(f"Экспорт проверок: {n} → {path}")
+
+        return ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Text("Проверки журнала", size=20, weight=ft.FontWeight.BOLD),
+                        ft.Container(expand=True),
+                        ft.Text(f"Порог длительности: > {thr:g} ч", size=12),
+                        ft.OutlinedButton(
+                            "Экспорт…",
+                            tooltip="Выгрузить длительные и без стола в Excel",
+                            on_click=exp,
+                        ),
+                    ]
+                ),
+                ft.Text(
+                    "№ истории, ФИО пациента, хирург, операция. "
+                    "Порог меняется на вкладке «Работа».",
+                    size=12,
+                    color=ft.Colors.ON_SURFACE_VARIANT,
+                ),
+                table_block(f"Длительные операции (> {thr:g} ч)", long_rows),
+                ft.Divider(),
+                table_block("Не занесены на опер. стол", miss_rows),
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+            spacing=10,
+        )
 
     def _screen_emk(self) -> ft.Control:
         rows = self.session.emk_mismatch_rows
