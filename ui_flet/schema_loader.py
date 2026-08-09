@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-APP_ROOT = Path(__file__).resolve().parents[1]
+from analyzers.app_paths import resolve_app_dir
+
+APP_ROOT = resolve_app_dir(package_file=Path(__file__))
 SCHEMAS = APP_ROOT / "schemas"
 
 

@@ -13,6 +13,7 @@ import openpyxl
 import pandas as pd
 import yaml
 
+from analyzers.app_paths import resolve_app_dir
 from analyzers.app_log import AppLog
 from analyzers.backup_utils import list_backups, restore_backup
 from analyzers.category_registry import save_config, shift_totals_rows_by_delta
@@ -49,7 +50,7 @@ from analyzers.ui_settings import load_settings, save_settings
 from analyzers.updater import read_local_version
 from analyzers.write_verify import format_verify_message, verify_write_report
 
-APP_DIR = Path(__file__).resolve().parents[1]
+APP_DIR = resolve_app_dir(package_file=Path(__file__))
 
 
 @dataclass
