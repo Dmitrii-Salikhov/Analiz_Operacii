@@ -7,8 +7,9 @@ from typing import List, Optional
 
 import flet as ft
 
+from analyzers.file_lock import FileLockedError, remove_stale_excel_lock
 from analyzers.summary_writer import MONTH_RU
-from ui_flet.app_context import AppContext
+from ui_flet.app_context import APP_ROOT, AppContext
 from ui_flet.screens.form14 import Form14ConstructorView
 from ui_flet.session import AppSession
 
@@ -62,6 +63,14 @@ class AnalizApp:
         page.window.height = 820
         page.window.min_width = 960
         page.window.min_height = 640
+        for _name in ("app_icon.ico", "app_icon.png"):
+            _icon = APP_ROOT / "assets" / _name
+            if _icon.is_file():
+                try:
+                    page.window.icon = str(_icon)
+                except Exception:
+                    pass
+                break
         page.padding = 0
         page.bgcolor = ft.Colors.SURFACE
 
@@ -369,7 +378,6 @@ class AnalizApp:
             return
         path = self.session.summary_path
         if not path or not Path(path).exists():
-            # выбрать сводную
             files = await self.file_picker.pick_files(
                 dialog_title="Выберите файл сводной",
                 allow_multiple=False,
@@ -381,7 +389,11 @@ class AnalizApp:
             self.session.summary_path = files[0].path
             self.session.persist()
 
+        await self._write_excel_attempt()
+
+    async def _write_excel_attempt(self) -> None:
         write_form = self.session.write_form and self.session.form4001_enabled()
+        path = self.session.summary_path
         try:
             report = self.session.write_excel(
                 write_weeks=self.session.write_weeks,
@@ -394,8 +406,71 @@ class AnalizApp:
                 msg += f"\n{report['verify_msg']}"
             self._snack(msg)
             self._set_status()
+        except FileLockedError as ex:
+            await self._show_file_locked_dialog(ex)
         except Exception as ex:
             self._snack(str(ex))
+
+    async def _show_file_locked_dialog(self, err: FileLockedError) -> None:
+        name = Path(err.path).name
+        lock_name = err.stale_lock.name if err.stale_lock else ""
+
+        async def retry(_e=None):
+            dlg.open = False
+            self.page.update()
+            await self._write_excel_attempt()
+
+        def close(_e=None):
+            dlg.open = False
+            self.page.update()
+
+        def reveal(_e=None):
+            try:
+                import os
+                import subprocess
+
+                if os.name == "nt":
+                    subprocess.Popen(["explorer", "/select,", err.path])
+                else:
+                    subprocess.Popen(["open", str(Path(err.path).parent)])
+            except Exception:
+                pass
+
+        async def clear_lock_and_retry(_e=None):
+            try:
+                remove_stale_excel_lock(err.path)
+            except OSError as ex:
+                self._snack(f"Не удалось удалить ~$: {ex}")
+            dlg.open = False
+            self.page.update()
+            await self._write_excel_attempt()
+
+        actions = [
+            ft.TextButton("Показать в папке", on_click=reveal),
+            ft.TextButton("Отмена", on_click=close),
+        ]
+        if err.stale_lock is not None:
+            actions.insert(
+                0,
+                ft.OutlinedButton(
+                    f"Удалить {lock_name}",
+                    tooltip="Убрать служебный «хвост» Excel после сбоя",
+                    on_click=clear_lock_and_retry,
+                ),
+            )
+        actions.append(ft.FilledButton("Повторить", on_click=retry))
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Не удалось записать сводную"),
+            content=ft.Text(
+                f"Файл: «{name}»\n\n{err.hint}\n\n{err.path}",
+                selectable=True,
+            ),
+            actions=actions,
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self.page.show_dialog(dlg)
 
     async def _export_report(self, _e=None) -> None:
         if self.session.store.ops.empty:

@@ -9,6 +9,7 @@ import re
 import shutil
 import ssl
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -249,6 +250,56 @@ def check_for_update(app_dir: Path, cfg: Dict[str, Any]) -> Optional[UpdateInfo]
     return None
 
 
+def _install_file(src: Path, dest: Path) -> None:
+    """
+    Копирует файл поверх dest. На Windows занятый .exe/.dll можно переименовать
+    в *.old и записать новый файл (работает, пока процесс держит старый образ).
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    last_err: Optional[BaseException] = None
+    for attempt in range(4):
+        try:
+            shutil.copy2(src, dest)
+            return
+        except PermissionError as e:
+            last_err = e
+            time.sleep(0.35 * (attempt + 1))
+        except OSError as e:
+            # WinError 32 часто приходит как PermissionError, но ловим шире
+            if getattr(e, "winerror", None) != 32 and e.errno not in (13, 11):
+                raise
+            last_err = e
+            time.sleep(0.35 * (attempt + 1))
+
+    # Переименование занятого файла (типичный трюк для running exe на Windows)
+    old = dest.with_name(dest.name + ".old")
+    try:
+        if old.exists():
+            try:
+                old.unlink()
+            except OSError:
+                old = dest.with_name(f"{dest.name}.old.{os.getpid()}")
+        if dest.exists():
+            os.replace(dest, old)
+        shutil.copy2(src, dest)
+        return
+    except OSError as e:
+        last_err = e
+
+    pending = dest.with_name(dest.name + ".new")
+    try:
+        shutil.copy2(src, pending)
+    except OSError:
+        pass
+    raise PermissionError(
+        f"Не удалось заменить «{dest.name}»: файл занят другим процессом "
+        f"(часто сам AnalizOperacii.exe при обновлении).\n\n"
+        f"Закройте программу полностью и установите обновление снова "
+        f"или скопируйте вручную из папки обновления.\n"
+        f"({last_err})"
+    ) from last_err
+
+
 def _should_skip_path(rel: Path, *, include_config: bool, preserve_data: bool) -> bool:
     parts_lower = [p.lower() for p in rel.parts]
     if any(p in SKIP_DIR_NAMES or p.startswith(".update_backup_") for p in parts_lower):
@@ -367,9 +418,12 @@ def apply_update_from_zip(
                 if backup and dest.exists():
                     bak_dest = Path(report["backup"]) / rel
                     bak_dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(dest, bak_dest)
+                    try:
+                        shutil.copy2(dest, bak_dest)
+                    except OSError:
+                        pass
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest)
+                _install_file(src, dest)
                 report["copied"].append(str(rel))
         else:
             if backup:
@@ -382,9 +436,12 @@ def apply_update_from_zip(
                 if backup and dest.exists():
                     bak_dest = Path(report["backup"]) / rel
                     bak_dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(dest, bak_dest)
+                    try:
+                        shutil.copy2(dest, bak_dest)
+                    except OSError:
+                        pass
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest)
+                _install_file(src, dest)
                 report["copied"].append(str(rel))
 
     report["count"] = len(report["copied"])

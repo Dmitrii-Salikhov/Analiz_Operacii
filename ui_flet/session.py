@@ -32,7 +32,7 @@ from analyzers.emk_kind_classify import (
 )
 from analyzers.emk_loader import emk_department_stats, read_emk_stationary_report
 from analyzers.export_report import export_month_like_summary
-from analyzers.file_lock import excel_file_locked
+from analyzers.file_lock import FileLockedError, ensure_excel_writable
 from analyzers.form_4001 import compute_form_4001, form_4001_preview_rows
 from analyzers.form14_export import form14_preview_rows_from_ops
 from analyzers.form14_overrides import default_path as form14_overrides_path
@@ -595,8 +595,7 @@ class AppSession:
         path = self.summary_path.strip()
         if not path or not os.path.exists(path):
             raise FileNotFoundError(f"Сводная не найдена: {path}")
-        if excel_file_locked(path):
-            raise RuntimeError(f"Файл занят в Excel:\n{path}")
+        ensure_excel_writable(path)
         if self.store.ops.empty:
             raise ValueError("Нет операций")
         d_min, d_max = self.last_batch_span

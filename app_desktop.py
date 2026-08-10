@@ -31,7 +31,7 @@ from analyzers.emk_kind_classify import (
 )
 from analyzers.emk_loader import emk_department_stats, read_emk_stationary_report
 from analyzers.export_report import export_month_like_summary
-from analyzers.file_lock import excel_file_locked
+from analyzers.file_lock import FileLockedError, excel_file_locked, probe_excel_lock, remove_stale_excel_lock
 from analyzers.form_4001 import compute_form_4001, form_4001_preview_rows
 from analyzers.io_utils import OperationsStore, read_table
 from analyzers.category_registry import (
@@ -2136,13 +2136,30 @@ class DesktopApp:
         top.focus_force()
 
     def _do_write_excel(self, path, d_min, d_max, *, write_weeks: bool, write_form: bool):
-        if excel_file_locked(path):
-            messagebox.showerror(
-                "Файл занят",
-                f"Сводная открыта в Excel или заблокирована:\n{path}\n\n"
-                "Закройте файл и повторите запись.",
-            )
-            return
+        st = probe_excel_lock(path)
+        if st.locked:
+            extra = ""
+            if st.lock_sibling and st.lock_sibling.exists():
+                if messagebox.askyesno(
+                    "Служебный файл Excel",
+                    f"Рядом найден «{st.lock_sibling.name}» (часто остаётся после сбоя Excel).\n\n"
+                    "Удалить его и повторить запись?",
+                ):
+                    try:
+                        remove_stale_excel_lock(path)
+                    except OSError as e:
+                        messagebox.showerror("Ошибка", str(e))
+                        return
+                    st = probe_excel_lock(path)
+            if st.locked:
+                messagebox.showerror(
+                    "Не удалось записать сводную",
+                    f"Файл недоступен для записи: «{Path(path).name}».\n\n"
+                    f"Причина: {st.detail or st.reason}\n\n"
+                    "Проверьте: Excel, синхронизацию OneDrive, антивирус.\n\n"
+                    f"{path}",
+                )
+                return
         try:
             self._busy(True)
             parts = []
@@ -2543,6 +2560,17 @@ class DesktopApp:
                     f"Версия {new_ver} установлена.\n\nПерезапустить приложение сейчас?",
                 ):
                     self._restart_app()
+            except PermissionError as e:
+                self.log_message(traceback.format_exc(), level="ERROR")
+                messagebox.showerror(
+                    "Обновление",
+                    "Не удалось заменить файлы — они заняты процессом "
+                    "(часто сам AnalizOperacii.exe).\n\n"
+                    "Закройте программу полностью и установите обновление снова "
+                    "через «Проверить обновления».\n\n"
+                    f"{e}",
+                    parent=top,
+                )
             except Exception as e:
                 self.log_message(traceback.format_exc(), level="ERROR")
                 messagebox.showerror("Обновление", str(e), parent=top)

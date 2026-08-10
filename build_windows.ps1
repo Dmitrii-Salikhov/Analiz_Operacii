@@ -18,7 +18,8 @@ $addData = @(
     "requirements.txt;.",
     "RELEASE_NOTES.md;.",
     "form14_overrides.yaml;.",
-    "schemas;schemas"
+    "schemas;schemas",
+    "assets;assets"
 )
 
 if (Test-Path "KSGoperacii.csv") {
@@ -45,6 +46,14 @@ $args = @(
     "--hidden-import", "pandas"
 )
 
+$icon = "assets\app_icon.ico"
+if (Test-Path $icon) {
+    $args += @("--icon", $icon)
+    Write-Host "Иконка: $icon"
+} else {
+    Write-Host "Предупреждение: нет $icon — сборка без иконки"
+}
+
 foreach ($d in $addData) {
     $args += @("--add-data", $d)
 }
@@ -64,6 +73,10 @@ Copy-Item -Force "run_flet.py" "$out\run_flet.py"
 if (Test-Path "schemas") {
     if (Test-Path "$out\schemas") { Remove-Item -Recurse -Force "$out\schemas" }
     Copy-Item -Recurse -Force "schemas" "$out\schemas"
+}
+if (Test-Path "assets") {
+    if (Test-Path "$out\assets") { Remove-Item -Recurse -Force "$out\assets" }
+    Copy-Item -Recurse -Force "assets" "$out\assets"
 }
 if (Test-Path "KSGoperacii.csv") {
     Copy-Item -Force "KSGoperacii.csv" "$out\KSGoperacii.csv"
