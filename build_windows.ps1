@@ -4,6 +4,8 @@
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 
 $name = "AnalizOperacii"
 $entry = "run_flet.py"
@@ -11,19 +13,22 @@ $icon = "assets\app_icon.ico"
 $fletViewOut = "build\flet_view"
 
 # Прогрев desktop-клиента Flet (скачивает client при первом импорте)
-Write-Host "Проверка Flet / flet_desktop…"
+Write-Host "Check Flet / flet_desktop..."
 python -c "import flet; import flet_desktop; print('flet', getattr(flet,'__version__', '?'))"
 
 if (-not (Test-Path $icon)) {
-    throw "Нет иконки: $icon"
+    throw "Missing icon: $icon"
 }
 
-# Патчим flet.exe (окно/taskbar) — иначе остаётся стандартная иконка Flet
-Write-Host "Патч иконки клиента Flet…"
+# Patch flet.exe (window/taskbar); PyInstaller --icon alone is not enough
+Write-Host "Patch Flet client icon..."
 if (Test-Path $fletViewOut) { Remove-Item -Recurse -Force $fletViewOut }
 python scripts\patch_flet_client_icon.py $icon $fletViewOut
+if ($LASTEXITCODE -ne 0) {
+    throw "patch_flet_client_icon.py failed with exit $LASTEXITCODE"
+}
 if (-not (Test-Path "$fletViewOut\flet\flet.exe")) {
-    throw "Патч клиента Flet не создал $fletViewOut\flet\flet.exe"
+    throw "Missing patched client: $fletViewOut\flet\flet.exe"
 }
 
 $addData = @(
@@ -68,7 +73,7 @@ foreach ($d in $addData) {
 }
 $pyiArgs += $entry
 
-Write-Host "Иконка exe: $icon"
+Write-Host "Exe icon: $icon"
 Write-Host "PyInstaller $($pyiArgs -join ' ')"
 pyinstaller @pyiArgs
 
@@ -102,6 +107,6 @@ if (Test-Path "Операции сводная 2026.xlsx") {
 
 $exe = Join-Path $out "$name.exe"
 if (-not (Test-Path $exe)) {
-    throw "Нет $exe — сборка Flet не создала exe"
+    throw "Missing $exe — Flet build did not produce exe"
 }
-Write-Host "Готово (Flet): $exe"
+Write-Host "Done (Flet): $exe"

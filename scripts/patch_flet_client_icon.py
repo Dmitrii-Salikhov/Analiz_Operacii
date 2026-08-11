@@ -13,22 +13,23 @@ from pathlib import Path
 
 
 def main() -> int:
+    # Windows CI consoles are often cp125x — keep stdout ASCII-safe.
     if sys.platform != "win32":
-        print("skip: patch_flet_client_icon только для Windows", file=sys.stderr)
+        print("skip: patch_flet_client_icon is Windows-only", file=sys.stderr)
         return 2
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("icon", type=Path, help="Путь к .ico")
+    parser.add_argument("icon", type=Path, help="Path to .ico")
     parser.add_argument(
         "out_dir",
         type=Path,
-        help="Каталог вывода (внутри появится flet/flet.exe)",
+        help="Output dir (will contain flet/flet.exe)",
     )
     args = parser.parse_args()
 
     icon = args.icon.resolve()
     if not icon.is_file():
-        print(f"нет иконки: {icon}", file=sys.stderr)
+        print(f"missing icon: {icon}", file=sys.stderr)
         return 1
 
     from flet_cli.__pyinstaller.utils import copy_flet_bin
@@ -36,16 +37,16 @@ def main() -> int:
 
     temp = copy_flet_bin()
     if not temp:
-        print("не удалось скопировать клиент Flet", file=sys.stderr)
+        print("failed to copy Flet client", file=sys.stderr)
         return 1
 
     exe = Path(temp) / "flet" / "flet.exe"
     if not exe.is_file():
-        print(f"нет {exe}", file=sys.stderr)
+        print(f"missing {exe}", file=sys.stderr)
         shutil.rmtree(temp, ignore_errors=True)
         return 1
 
-    print(f"Патч иконки: {exe} <- {icon}")
+    print(f"Patching Flet view icon: {exe} <- {icon}")
     update_flet_view_icon(str(exe), str(icon))
 
     out = args.out_dir.resolve()
@@ -55,7 +56,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     shutil.copytree(Path(temp) / "flet", dest)
     shutil.rmtree(temp, ignore_errors=True)
-    print(f"Готово: {dest / 'flet.exe'}")
+    print(f"OK: {dest / 'flet.exe'}")
     return 0
 
 
