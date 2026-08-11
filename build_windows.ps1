@@ -7,10 +7,24 @@ Set-Location $PSScriptRoot
 
 $name = "AnalizOperacii"
 $entry = "run_flet.py"
+$icon = "assets\app_icon.ico"
+$fletViewOut = "build\flet_view"
 
 # Прогрев desktop-клиента Flet (скачивает client при первом импорте)
 Write-Host "Проверка Flet / flet_desktop…"
 python -c "import flet; import flet_desktop; print('flet', getattr(flet,'__version__', '?'))"
+
+if (-not (Test-Path $icon)) {
+    throw "Нет иконки: $icon"
+}
+
+# Патчим flet.exe (окно/taskbar) — иначе остаётся стандартная иконка Flet
+Write-Host "Патч иконки клиента Flet…"
+if (Test-Path $fletViewOut) { Remove-Item -Recurse -Force $fletViewOut }
+python scripts\patch_flet_client_icon.py $icon $fletViewOut
+if (-not (Test-Path "$fletViewOut\flet\flet.exe")) {
+    throw "Патч клиента Flet не создал $fletViewOut\flet\flet.exe"
+}
 
 $addData = @(
     "VERSION;.",
@@ -19,7 +33,8 @@ $addData = @(
     "RELEASE_NOTES.md;.",
     "form14_overrides.yaml;.",
     "schemas;schemas",
-    "assets;assets"
+    "assets;assets",
+    "$fletViewOut;flet_view"
 )
 
 if (Test-Path "KSGoperacii.csv") {
@@ -29,12 +44,14 @@ if (Test-Path "Операции сводная 2026.xlsx") {
     $addData += "Операции сводная 2026.xlsx;."
 }
 
-$args = @(
+# Не использовать имя $args — в PowerShell это автоматическая переменная
+$pyiArgs = @(
     "--noconfirm",
     "--clean",
     "--windowed",
     "--onedir",
     "--name", $name,
+    "--icon", $icon,
     "--collect-submodules", "analyzers",
     "--collect-submodules", "ui_flet",
     "--collect-all", "flet",
@@ -46,21 +63,14 @@ $args = @(
     "--hidden-import", "pandas"
 )
 
-$icon = "assets\app_icon.ico"
-if (Test-Path $icon) {
-    $args += @("--icon", $icon)
-    Write-Host "Иконка: $icon"
-} else {
-    Write-Host "Предупреждение: нет $icon — сборка без иконки"
-}
-
 foreach ($d in $addData) {
-    $args += @("--add-data", $d)
+    $pyiArgs += @("--add-data", $d)
 }
-$args += $entry
+$pyiArgs += $entry
 
-Write-Host "PyInstaller $($args -join ' ')"
-pyinstaller @args
+Write-Host "Иконка exe: $icon"
+Write-Host "PyInstaller $($pyiArgs -join ' ')"
+pyinstaller @pyiArgs
 
 # Дублируем служебные файлы в корень папки (рядом с AnalizOperacii.exe)
 $out = "dist\$name"
@@ -77,6 +87,11 @@ if (Test-Path "schemas") {
 if (Test-Path "assets") {
     if (Test-Path "$out\assets") { Remove-Item -Recurse -Force "$out\assets" }
     Copy-Item -Recurse -Force "assets" "$out\assets"
+}
+# Клиент с иконкой рядом с exe (FLET_VIEW_PATH в run_flet.py)
+if (Test-Path $fletViewOut) {
+    if (Test-Path "$out\flet_view") { Remove-Item -Recurse -Force "$out\flet_view" }
+    Copy-Item -Recurse -Force $fletViewOut "$out\flet_view"
 }
 if (Test-Path "KSGoperacii.csv") {
     Copy-Item -Force "KSGoperacii.csv" "$out\KSGoperacii.csv"

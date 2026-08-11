@@ -64,13 +64,20 @@ class AnalizApp:
         page.window.min_width = 960
         page.window.min_height = 640
         for _name in ("app_icon.ico", "app_icon.png"):
-            _icon = APP_ROOT / "assets" / _name
-            if _icon.is_file():
-                try:
-                    page.window.icon = str(_icon)
-                except Exception:
-                    pass
-                break
+            for _base in (
+                APP_ROOT / "assets",
+                APP_ROOT / "_internal" / "assets",
+            ):
+                _icon = _base / _name
+                if _icon.is_file():
+                    try:
+                        page.window.icon = str(_icon)
+                    except Exception:
+                        pass
+                    break
+            else:
+                continue
+            break
         page.padding = 0
         page.bgcolor = ft.Colors.SURFACE
 
@@ -1110,7 +1117,12 @@ def main(page: ft.Page | None = None) -> None:
     if page is not None:
         _run(page)
         return
-    ft.app(target=_run)
+    assets = None
+    for cand in (APP_ROOT / "assets", APP_ROOT / "_internal" / "assets"):
+        if cand.is_dir():
+            assets = str(cand)
+            break
+    ft.app(target=_run, assets_dir=assets)
 
 
 if __name__ == "__main__":
