@@ -35,9 +35,23 @@ def test_parse_sha256_text():
     assert parse_sha256_text(h) == h
 
 
+def test_progress_emit_safe():
+    from analyzers.updater import _emit
+
+    seen = []
+
+    def boom(msg, frac):
+        seen.append((msg, frac))
+        raise RuntimeError("ui boom")
+
+    _emit(boom, "ok", 0.5)
+    assert seen == [("ok", 0.5)]
+
+
 if __name__ == "__main__":
     test_parse_version()
     test_is_newer()
     test_local_version_file()
     test_parse_sha256_text()
+    test_progress_emit_safe()
     print("OK")

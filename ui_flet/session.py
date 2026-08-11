@@ -57,7 +57,15 @@ from analyzers.surgery import (
     reclassify_ops_by_keywords,
 )
 from analyzers.ui_settings import load_settings, save_settings
-from analyzers.updater import read_local_version
+from analyzers.updater import (
+    ProgressCallback,
+    UpdateInfo,
+    apply_update_from_zip,
+    check_for_update,
+    format_update_notes,
+    read_local_version,
+    resolve_token,
+)
 from analyzers.write_verify import format_verify_message, verify_write_report
 
 APP_DIR = resolve_app_dir(package_file=Path(__file__))
@@ -800,6 +808,53 @@ class AppSession:
     def form4001_enabled(self) -> bool:
         return form_4001_enabled(self.summary_cfg)
 
+    def updates_config(self) -> dict:
+        return dict(self.config.get("updates") or {})
+
+    def check_for_app_update(self) -> Optional[UpdateInfo]:
+        """Проверить GitHub Releases. None = уже актуальная версия."""
+        cfg = self.updates_config()
+        if not cfg.get("enabled", True):
+            raise RuntimeError("Проверка обновлений отключена в config.yaml (updates.enabled)")
+        info = check_for_update(self.app_dir, cfg)
+        if info is None:
+            self.log(f"Обновления: актуальная версия {read_local_version(self.app_dir)}")
+        else:
+            self.log(
+                f"Обновления: доступна {info.remote_version} (сейчас {info.local_version})"
+            )
+        return info
+
+    def format_app_update_notes(self, info: UpdateInfo) -> str:
+        return format_update_notes(info)
+
+    def apply_app_update(
+        self,
+        info: UpdateInfo,
+        *,
+        include_config: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> dict:
+        cfg = self.updates_config()
+        report = apply_update_from_zip(
+            self.app_dir,
+            info.zip_url,
+            token=resolve_token(cfg),
+            include_config=include_config,
+            backup=True,
+            sha256_url=info.sha256_url,
+            require_sha256=bool(info.source == "release-asset"),
+            mode="release-asset" if info.source == "release-asset" else "auto",
+            on_progress=on_progress,
+        )
+        new_ver = str(report.get("new_version") or read_local_version(self.app_dir))
+        self.version = new_ver
+        self.log(
+            f"Обновление установлено: v{new_ver} "
+            f"({report.get('count')} файлов), backup={report.get('backup')}"
+        )
+        return report
+
     def open_path(self, path: str) -> None:
         import subprocess
         import sys
@@ -811,3 +866,18 @@ class AppSession:
             os.startfile(p)  # type: ignore[attr-defined]
         else:
             subprocess.Popen(["xdg-open", p])
+
+    def spawn_restart(self) -> None:
+        """Запустить новый процесс приложения (вызов перед выходом)."""
+        import subprocess
+        import sys
+
+        self.persist()
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable]
+        else:
+            entry = self.app_dir / "run_flet.py"
+            if not entry.exists():
+                entry = self.app_dir / "app_desktop.py"
+            cmd = [sys.executable, str(entry)]
+        subprocess.Popen(cmd, cwd=str(self.app_dir))

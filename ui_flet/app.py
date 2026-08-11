@@ -182,10 +182,11 @@ class AnalizApp:
             on_select=self._on_dept,
             tooltip="Текущее отделение для фильтра журнала и сводной",
         )
+        self.version_label = ft.Text(f"v{self.session.version}", weight=ft.FontWeight.BOLD)
         self.top_bar = ft.Container(
             content=ft.Row(
                 [
-                    ft.Text(f"v{self.session.version}", weight=ft.FontWeight.BOLD),
+                    self.version_label,
                     self.dept_dd,
                     ft.FilledButton(
                         "Опержурнал…",
@@ -221,6 +222,11 @@ class AnalizApp:
                         "Открыть Excel",
                         tooltip="Открыть файл сводной во внешнем Excel",
                         on_click=self._open_excel,
+                    ),
+                    ft.OutlinedButton(
+                        "Обновления…",
+                        tooltip="Проверить обновления на GitHub Releases",
+                        on_click=self._check_updates,
                     ),
                 ],
                 spacing=8,
@@ -576,6 +582,189 @@ class AnalizApp:
             self._snack("Файл сводной не найден")
             return
         self.session.open_path(p)
+
+    async def _check_updates(self, _e=None) -> None:
+        import asyncio
+
+        busy = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Обновления"),
+            content=ft.Column(
+                [
+                    ft.ProgressBar(width=360),
+                    ft.Text("Проверка GitHub Releases…", size=12),
+                ],
+                tight=True,
+                width=380,
+            ),
+            actions=[],
+        )
+        self.page.show_dialog(busy)
+        try:
+            info = await asyncio.to_thread(self.session.check_for_app_update)
+        except Exception as ex:
+            busy.open = False
+            self.page.update()
+            self._snack(str(ex))
+            return
+        busy.open = False
+        self.page.update()
+
+        if info is None:
+            self._snack(f"У вас актуальная версия: {self.session.version}")
+            return
+
+        notes = self.session.format_app_update_notes(info)
+        include_cfg = ft.Checkbox(
+            label="Также заменить config.yaml (обычно не нужно)",
+            value=False,
+        )
+        notes_box = ft.TextField(
+            value=notes,
+            multiline=True,
+            min_lines=10,
+            max_lines=14,
+            read_only=True,
+            text_size=12,
+            width=520,
+        )
+
+        offer = ft.AlertDialog(modal=True, title=ft.Text("Доступно обновление"), actions=[])
+
+        def close_offer(_e=None):
+            offer.open = False
+            self.page.update()
+
+        def open_github(_e=None):
+            if info.html_url:
+                self.session.open_path(info.html_url)
+
+        async def do_install(_e=None):
+            offer.open = False
+            self.page.update()
+            await self._install_update(info, include_config=bool(include_cfg.value))
+
+        offer.content = ft.Column(
+            [
+                ft.Text(
+                    f"Найдена версия {info.remote_version} (сейчас {info.local_version})",
+                    weight=ft.FontWeight.BOLD,
+                ),
+                notes_box,
+                include_cfg,
+            ],
+            tight=True,
+            width=540,
+            scroll=ft.ScrollMode.AUTO,
+        )
+        offer.actions = [
+            ft.TextButton("Позже", on_click=close_offer),
+            ft.OutlinedButton("GitHub", on_click=open_github),
+            ft.FilledButton("Установить", on_click=do_install),
+        ]
+        offer.actions_alignment = ft.MainAxisAlignment.END
+        self.page.show_dialog(offer)
+
+    async def _install_update(self, info, *, include_config: bool) -> None:
+        import asyncio
+
+        from analyzers.release_notes import format_whats_new
+
+        status = ft.Text("Подготовка…", size=12)
+        bar = ft.ProgressBar(width=420, value=0)
+        prog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Установка v{info.remote_version}"),
+            content=ft.Column([bar, status], tight=True, width=440),
+            actions=[],
+        )
+        self.page.show_dialog(prog)
+
+        def on_progress(msg: str, frac) -> None:
+            status.value = msg or ""
+            if frac is None:
+                bar.value = None  # indeterminate
+            else:
+                try:
+                    bar.value = max(0.0, min(1.0, float(frac)))
+                except (TypeError, ValueError):
+                    bar.value = None
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+        try:
+            report = await asyncio.to_thread(
+                self.session.apply_app_update,
+                info,
+                include_config=include_config,
+                on_progress=on_progress,
+            )
+        except PermissionError as ex:
+            prog.open = False
+            self.page.update()
+            self._snack(
+                "Не удалось заменить файлы — закройте программу и установите обновление снова. "
+                f"{ex}"
+            )
+            return
+        except Exception as ex:
+            prog.open = False
+            self.page.update()
+            self._snack(str(ex))
+            return
+
+        new_ver = str(report.get("new_version") or self.session.version)
+        self.session.version = new_ver
+        self.version_label.value = f"v{new_ver}"
+        self.page.title = f"Сводная операций  v{new_ver}"
+
+        whats = format_whats_new(
+            new_ver,
+            path=self.session.app_dir / "RELEASE_NOTES.md",
+            previous_version=info.local_version,
+        )
+        status.value = f"Готово: v{new_ver} ({report.get('count', 0)} файлов)"
+        bar.value = 1
+        self.page.update()
+
+        done = ft.AlertDialog(modal=True, title=ft.Text(f"Установлена версия {new_ver}"), actions=[])
+
+        def close_done(_e=None):
+            done.open = False
+            prog.open = False
+            self.page.update()
+
+        def restart(_e=None):
+            try:
+                self.session.spawn_restart()
+            except Exception as ex:
+                self._snack(f"Не удалось перезапустить: {ex}")
+                return
+            try:
+                self.page.window.destroy()
+            except Exception:
+                pass
+            raise SystemExit(0)
+
+        done.content = ft.Column(
+            [
+                ft.Text(whats or f"Версия {new_ver} установлена.", selectable=True, size=12),
+                ft.Text("Перезапустите приложение, чтобы применить изменения.", size=12),
+            ],
+            tight=True,
+            width=520,
+            height=280,
+            scroll=ft.ScrollMode.AUTO,
+        )
+        done.actions = [
+            ft.TextButton("Позже", on_click=close_done),
+            ft.FilledButton("Перезапустить", on_click=restart),
+        ]
+        done.actions_alignment = ft.MainAxisAlignment.END
+        prog.open = False
+        self.page.show_dialog(done)
 
     # ——— screens ———
     def _screen_work(self) -> ft.Control:

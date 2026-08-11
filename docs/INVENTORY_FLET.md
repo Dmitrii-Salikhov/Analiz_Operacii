@@ -43,7 +43,7 @@
 | add_category | Добавить операцию… | `category_registry` ± `summary_layout` | shell |
 | delete_category | Удалить операцию… | `unregister_category` ± delete row | shell |
 | clear_store | Очистить | `OperationsStore.clear` | shell |
-| check_updates | Проверить обновления… | `updater` | shell |
+| check_updates | Проверить обновления… | `updater` | done |
 | whats_new | Что нового… | `release_notes` | shell |
 | about | О программе | VERSION | shell |
 | refresh_preview | Обновить превью | `build_summary_tables` | shell |

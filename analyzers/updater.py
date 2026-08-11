@@ -15,11 +15,23 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ZIP_FILENAME = "AnalizOperacii-Windows.zip"
 SHA256_FILENAME = "AnalizOperacii-Windows.zip.sha256"
 EXE_NAME = "AnalizOperacii.exe"
+
+# message, fraction in [0, 1] or None (indeterminate)
+ProgressCallback = Callable[[str, Optional[float]], None]
+
+
+def _emit(on_progress: Optional[ProgressCallback], message: str, fraction: Optional[float] = None) -> None:
+    if on_progress is None:
+        return
+    try:
+        on_progress(message, fraction)
+    except Exception:
+        pass
 
 SKIP_DIR_NAMES = {
     ".git",
@@ -99,13 +111,41 @@ def _http_json(url: str, token: Optional[str] = None, timeout: int = 30) -> Any:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_download(url: str, dest: Path, token: Optional[str] = None, timeout: int = 180) -> None:
+def _http_download(
+    url: str,
+    dest: Path,
+    token: Optional[str] = None,
+    timeout: int = 180,
+    on_progress: Optional[ProgressCallback] = None,
+) -> None:
     headers = _github_headers(token)
     headers = dict(headers)
     headers["Accept"] = "application/octet-stream"
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, context=_ssl_context(), timeout=timeout) as resp:
-        dest.write_bytes(resp.read())
+        total_raw = resp.headers.get("Content-Length")
+        try:
+            total = int(total_raw) if total_raw else 0
+        except ValueError:
+            total = 0
+        downloaded = 0
+        chunk_size = 64 * 1024
+        with open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    frac = min(1.0, downloaded / total)
+                    mb = downloaded / (1024 * 1024)
+                    total_mb = total / (1024 * 1024)
+                    _emit(on_progress, f"Скачивание… {mb:.1f} / {total_mb:.1f} МБ", frac * 0.55)
+                else:
+                    mb = downloaded / (1024 * 1024)
+                    _emit(on_progress, f"Скачивание… {mb:.1f} МБ", None)
+    _emit(on_progress, "Скачивание завершено", 0.55)
 
 
 def resolve_token(cfg: Dict[str, Any]) -> Optional[str]:
@@ -346,6 +386,7 @@ def apply_update_from_zip(
     sha256_url: Optional[str] = None,
     require_sha256: bool = False,
     mode: str = "auto",
+    on_progress: Optional[ProgressCallback] = None,
 ) -> Dict[str, Any]:
     """
     mode:
@@ -363,9 +404,11 @@ def apply_update_from_zip(
     with tempfile.TemporaryDirectory(prefix="analiz_upd_") as tmp:
         tmp_path = Path(tmp)
         zip_path = tmp_path / "update.zip"
-        _http_download(zip_url, zip_path, token=token)
+        _emit(on_progress, "Загрузка архива…", 0.0)
+        _http_download(zip_url, zip_path, token=token, on_progress=on_progress)
 
         if sha256_url:
+            _emit(on_progress, "Проверка SHA-256…", 0.58)
             sha_path = tmp_path / "update.sha256"
             _http_download(sha256_url, sha_path, token=token)
             expected = parse_sha256_text(sha_path.read_text(encoding="utf-8", errors="ignore"))
@@ -377,9 +420,11 @@ def apply_update_from_zip(
                     f"SHA-256 не совпала (ожидали {expected}, получили {actual})"
                 )
             report["sha256_ok"] = actual
+            _emit(on_progress, "SHA-256 OK", 0.62)
         elif require_sha256:
             raise RuntimeError("В релизе нет SHA-256 — обновление отменено")
 
+        _emit(on_progress, "Распаковка…", 0.65)
         extract_dir = tmp_path / "src"
         extract_dir.mkdir()
         with zipfile.ZipFile(zip_path, "r") as zf:
@@ -396,56 +441,53 @@ def apply_update_from_zip(
                 p.name.endswith(".exe") for p in src_root.iterdir() if p.is_file()
             )
 
+        def _copy_files(files: List[Path], *, asset_layout: bool) -> None:
+            total = max(len(files), 1)
+            for i, src in enumerate(files, start=1):
+                rel = src.relative_to(src_root)
+                if asset_layout:
+                    if _should_skip_path(rel, include_config=include_config, preserve_data=False):
+                        if rel.name.lower() in SKIP_FILE_NAMES:
+                            continue
+                        if not include_config and rel.name.lower() == "config.yaml":
+                            if (app_dir / rel).exists():
+                                continue
+                dest = app_dir / rel
+                if backup and dest.exists():
+                    bak_dest = Path(report["backup"]) / rel
+                    bak_dest.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        shutil.copy2(dest, bak_dest)
+                    except OSError:
+                        pass
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                _install_file(src, dest)
+                report["copied"].append(str(rel))
+                frac = 0.68 + 0.30 * (i / total)
+                name = rel.name if len(str(rel)) > 48 else str(rel)
+                _emit(on_progress, f"Установка ({i}/{total}): {name}", min(0.98, frac))
+
         if mode == "release-asset" or (mode == "auto" and use_asset_layout):
             # Windows onedir ZIP: всё поверх app_dir, кроме пользовательских данных
             if backup:
                 bak_root = app_dir / f".update_backup_{_timestamp()}"
                 bak_root.mkdir(parents=True, exist_ok=True)
                 report["backup"] = str(bak_root)
-            for src in src_root.rglob("*"):
-                if not src.is_file():
-                    continue
-                rel = src.relative_to(src_root)
-                if _should_skip_path(rel, include_config=include_config, preserve_data=False):
-                    # для asset всё же не трогаем ui_settings / логи
-                    if rel.name.lower() in SKIP_FILE_NAMES:
-                        continue
-                    if not include_config and rel.name.lower() == "config.yaml":
-                        # если у пользователя уже есть config — сохраняем
-                        if (app_dir / rel).exists():
-                            continue
-                dest = app_dir / rel
-                if backup and dest.exists():
-                    bak_dest = Path(report["backup"]) / rel
-                    bak_dest.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        shutil.copy2(dest, bak_dest)
-                    except OSError:
-                        pass
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                _install_file(src, dest)
-                report["copied"].append(str(rel))
+            files = [p for p in src_root.rglob("*") if p.is_file()]
+            _emit(on_progress, f"Установка файлов ({len(files)})…", 0.68)
+            _copy_files(files, asset_layout=True)
         else:
             if backup:
                 bak_root = app_dir / f".update_backup_{_timestamp()}"
                 bak_root.mkdir(parents=True, exist_ok=True)
                 report["backup"] = str(bak_root)
-            for src in _iter_code_files(src_root, include_config=include_config):
-                rel = src.relative_to(src_root)
-                dest = app_dir / rel
-                if backup and dest.exists():
-                    bak_dest = Path(report["backup"]) / rel
-                    bak_dest.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        shutil.copy2(dest, bak_dest)
-                    except OSError:
-                        pass
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                _install_file(src, dest)
-                report["copied"].append(str(rel))
+            files = list(_iter_code_files(src_root, include_config=include_config))
+            _emit(on_progress, f"Установка кода ({len(files)})…", 0.68)
+            _copy_files(files, asset_layout=False)
 
     report["count"] = len(report["copied"])
     report["new_version"] = read_local_version(app_dir)
+    _emit(on_progress, f"Готово: v{report['new_version']} ({report['count']} файлов)", 1.0)
     return report
 
 
