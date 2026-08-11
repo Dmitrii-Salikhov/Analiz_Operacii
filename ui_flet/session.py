@@ -21,6 +21,7 @@ from analyzers.category_registry import (
     register_category,
     save_config,
     shift_totals_rows_by_delta,
+    unregister_category,
 )
 from analyzers.dept_config import (
     dept_summary_key,
@@ -49,6 +50,7 @@ from analyzers.op_quality_checks import (
     long_op_hours_from_config,
 )
 from analyzers.problem_codes import build_problem_codes_table
+from analyzers.summary_layout import add_category_row_to_summary, find_anchor_row
 from analyzers.summary_writer import MONTH_RU, SummaryWriter, compute_month_weeks, read_sheet_weeks
 from analyzers.surgery import (
     SurgeryAnalyzer,
@@ -686,11 +688,14 @@ class AppSession:
             df.to_csv(out_path, index=False, encoding="utf-8-sig")
         return len(df)
 
-    def add_category_and_reclassify(self, spec: CategorySpec) -> dict:
+    def add_category_and_reclassify(
+        self, spec: CategorySpec, *, update_excel: bool = True
+    ) -> dict:
         """
-        Добавляет категорию в config.yaml и переклассифицирует накопитель по ключевым словам.
+        Добавляет категорию в config.yaml, физически вставляет строку в сводную
+        (иначе номера строк в config и Excel разъезжаются) и переклассифицирует накопитель.
 
-        Важно: это именно “конструктор” для вкладки «Не классифицировано».
+        Конструктор вкладки «Не классифицировано» — аналог Tk «В программе + Excel».
         """
         updated_cfg, result = register_category(
             self.app_dir / "config.yaml",
@@ -701,6 +706,68 @@ class AppSession:
         self.config = updated_cfg
         self._sync_dept()
 
+        warnings = list(result.warnings or [])
+        excel_report: Optional[dict] = None
+
+        if update_excel:
+            path = (self.summary_path or "").strip()
+            if not path or not os.path.exists(path):
+                # Откат config: иначе номера строк «уплывут» относительно файла.
+                self.config, _ = unregister_category(
+                    self.app_dir / "config.yaml",
+                    result.name,
+                    config=self.config,
+                    summary_key=self.summary_key,
+                )
+                self._sync_dept()
+                raise FileNotFoundError(
+                    "Сводная не найдена — укажите файл на вкладке «Работа». "
+                    "Без вставки строки в Excel таблица «съедет» при записи."
+                )
+            try:
+                ensure_excel_writable(path)
+                sheets = {
+                    int(k): v for k, v in (self.summary_cfg.get("sheet_names") or {}).items()
+                }
+                # После register category_rows уже сдвинуты; якорь (строка < insert) без изменений.
+                anchor_row = find_anchor_row(
+                    self.summary_cfg.get("category_rows") or {}, spec.anchor_category
+                )
+                excel_report = add_category_row_to_summary(
+                    path,
+                    category_name=result.name,
+                    excel_row=result.excel_row,
+                    form_line=spec.form_line,
+                    sheet_names=sheets,
+                    form_cfg=self.summary_cfg.get("form_4001") or {},
+                    kind=spec.kind,
+                    histology=bool(spec.histology),
+                    endoscopic=bool(spec.endoscopic),
+                    anchor_row=anchor_row,
+                    backup=True,
+                    backup_keep=int(self.summary_cfg.get("backup_keep", 20)),
+                )
+            except Exception:
+                self.config, _ = unregister_category(
+                    self.app_dir / "config.yaml",
+                    result.name,
+                    config=self.config,
+                    summary_key=self.summary_key,
+                )
+                self._sync_dept()
+                raise
+            blank_delta = int(excel_report.get("blank_delta") or 0)
+            if blank_delta:
+                shift_totals_rows_by_delta(
+                    self.config, blank_delta, summary_key=self.summary_key
+                )
+                save_config(self.config, self.app_dir / "config.yaml")
+                self._sync_dept()
+            self.log(
+                f"В сводную вставлена «{result.name}» → строка {result.excel_row} "
+                f"(месяцы: {len(excel_report.get('sheets') or [])})"
+            )
+
         if not self.store.ops.empty:
             self.store.ops = reclassify_ops_by_keywords(
                 self.store.ops, self._surgery_categories()
@@ -709,7 +776,12 @@ class AppSession:
         if not self.store.ops.empty:
             self.run_analysis()
 
-        return {"added": result.name, "excel_row": result.excel_row, "warnings": result.warnings}
+        return {
+            "added": result.name,
+            "excel_row": result.excel_row,
+            "warnings": warnings,
+            "excel": excel_report,
+        }
 
     def assign_disputed_category(self, store_index: int, category_name: str) -> None:
         """Ручное назначение категории для спорной операции (как в Tk-диалоге)."""

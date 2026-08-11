@@ -1227,17 +1227,19 @@ class AnalizApp:
             self._snack(f"Проблемных кодов: {n}")
 
         def open_constructor(row: dict):
-            # Делаем “конструктор” максимально близким по смыслу к Tk:
-            # пользователь добавляет новую категорию в config.yaml, затем накопитель переклассифицируется.
+            # Как Tk «В программе + Excel»: config + физическая строка в сводной.
             from analyzers.category_registry import (
                 CategorySpec,
                 FORM_LINES,
+                default_anchor_category,
                 suggest_keywords_from_name,
             )
 
             cats = list((self.session.summary_cfg.get("category_rows") or {}).keys())
             anchor_options = cats[:]
-            anchor_default = cats[0] if cats else ""
+            anchor_default = default_anchor_category(
+                self.session.config, self.session.summary_key
+            ) or (cats[0] if cats else "")
 
             name_default = str(row.get("КСГ_название") or row.get("Услуга") or "").strip()[:120]
             codes_default = str(row.get("Код") or "").strip()
@@ -1308,9 +1310,10 @@ class AnalizApp:
                         anchor_category=str(anchor_dd.value or ""),
                     )
                     res = self.session.add_category_and_reclassify(spec)
-                    self._snack(f"Категория добавлена: {res['added']}")
+                    row_n = res.get("excel_row")
+                    self._snack(f"Категория «{res['added']}» → строка Excel {row_n}")
                     if res.get("warnings"):
-                        self._snack("Есть предупреждения в лог/консоль")
+                        self._snack("Есть предупреждения — см. журнал")
                     close()
                     self.show("uncl")
                 except Exception as ex:
@@ -1318,7 +1321,7 @@ class AnalizApp:
 
             actions = [
                 ft.TextButton("Отмена", on_click=close),
-                ft.FilledButton("Добавить и переклассифицировать", on_click=apply),
+                ft.FilledButton("Добавить в config и Excel", on_click=apply),
             ]
             dlg.title = ft.Text("Конструктор: добавить категорию")
             dlg.content = ft.Column(
@@ -1331,7 +1334,8 @@ class AnalizApp:
                     ft.Row([hist_cb, endo_cb]),
                     anchor_dd,
                     ft.Text(
-                        "После добавления категории накопитель переклассифицируется по ключевым словам.",
+                        "Категория пишется в config и вставляется строкой в сводную Excel "
+                        "(закройте файл в Excel). Затем накопитель переклассифицируется по ключам.",
                         size=12,
                         color=ft.Colors.GREY_700,
                     ),

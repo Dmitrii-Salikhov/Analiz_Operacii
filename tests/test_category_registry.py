@@ -311,3 +311,91 @@ def test_ensure_one_blank_before_totals_trims_extras(tmp_path: Path):
     assert ws["B37"].value == "Биопсия"
     assert ws["B38"].value in (None, "")
     assert ws["B39"].value == "Всего операций"
+
+
+def test_config_only_register_desyncs_excel_labels(tmp_path: Path):
+    """
+    Регрессия Flet-конструктора: только config без insert_rows —
+    category_rows указывают на строку без названия в B, данные «съезжают».
+    """
+    xlsx = tmp_path / "summary.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Январь"
+    ws["B37"] = "Биопсия гортани "
+    ws["B38"] = None
+    ws["B39"] = "Всего операций"
+    wb.save(xlsx)
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg = _minimal_config()
+    with cfg_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True)
+
+    _cfg, result = register_category(
+        cfg_path,
+        CategorySpec(
+            name="Мирингопластика",
+            codes=["X"],
+            name_keywords=["мирингопластика"],
+            kind="plan",
+            form_line="6",
+            anchor_category="Биопсия гортани ",
+        ),
+    )
+    assert result.excel_row == 38
+    assert _cfg["summary"]["category_rows"]["Мирингопластика"] == 38
+    # Excel без физической вставки — названия новой категории нет
+    wb2 = openpyxl.load_workbook(xlsx)
+    assert wb2["Январь"]["B38"].value in (None, "")
+    assert wb2["Январь"]["B39"].value == "Всего операций"
+
+
+def test_register_plus_physical_insert_keeps_label(tmp_path: Path):
+    """Правильный путь (как session.add_category_and_reclassify): config + insert."""
+    xlsx = tmp_path / "summary.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Январь"
+    ws["B37"] = "Биопсия гортани "
+    ws["H37"] = "=SUM(C37:G37)"
+    ws["B39"] = "Всего операций"
+    ws["C39"] = "=SUM(C4:C37)"
+    ws["B40"] = "Дети"
+    ws["B41"] = "Человек"
+    wb.save(xlsx)
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg = _minimal_config()
+    cfg["summary"]["totals_rows"] = {"children": 40, "patients": 41}
+    with cfg_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, allow_unicode=True)
+
+    _cfg, result = register_category(
+        cfg_path,
+        CategorySpec(
+            name="Мирингопластика",
+            codes=["X"],
+            name_keywords=["мирингопластика"],
+            kind="plan",
+            form_line="6",
+            histology=False,
+            anchor_category="Биопсия гортани ",
+        ),
+    )
+    add_category_row_to_summary(
+        xlsx,
+        category_name=result.name,
+        excel_row=result.excel_row,
+        form_line="6",
+        sheet_names={1: "Январь"},
+        form_cfg=_cfg["summary"].get("form_4001") or {},
+        kind="plan",
+        backup=False,
+    )
+    wb2 = openpyxl.load_workbook(xlsx)
+    ws2 = wb2["Январь"]
+    assert ws2["B38"].value == "Мирингопластика"
+    # одна пустая перед «Всего»
+    assert ws2["B39"].value in (None, "")
+    assert ws2["B40"].value == "Всего операций"
