@@ -87,6 +87,7 @@ class AnalizApp:
             ft.Column(
                 [
                     self.top_bar,
+                    self.warn_banner,
                     ft.Row(
                         [
                             self.sidebar,
@@ -126,6 +127,50 @@ class AnalizApp:
 
     def _set_status(self, msg: Optional[str] = None) -> None:
         self.status.value = msg or self.session.status
+        self._refresh_warn_banner()
+
+    def _class_issue_counts(self) -> tuple[int, int]:
+        n_uncl = len(self.session.unclassified_rows or [])
+        n_disp = len(self.session.disputed_rows or [])
+        return n_uncl, n_disp
+
+    def _refresh_warn_banner(self) -> None:
+        n_uncl, n_disp = self._class_issue_counts()
+        if n_uncl <= 0 and n_disp <= 0:
+            self.warn_banner.visible = False
+            self.warn_banner.content = ft.Container()
+            return
+
+        parts: List[str] = []
+        if n_uncl:
+            parts.append(f"не классифицировано: {n_uncl}")
+        if n_disp:
+            parts.append(f"спорных: {n_disp}")
+        msg = "Перед записью в Excel разберите: " + ", ".join(parts)
+
+        actions: List[ft.Control] = [
+            ft.Icon(ft.Icons.WARNING_AMBER, color=ft.Colors.ON_SECONDARY_CONTAINER, size=18),
+            ft.Text(msg, size=12, weight=ft.FontWeight.BOLD, expand=True),
+        ]
+        if n_uncl:
+            actions.append(
+                ft.TextButton(
+                    f"Не класс. ({n_uncl})",
+                    tooltip="Открыть конструктор неклассифицированных",
+                    on_click=lambda e: self.show("uncl"),
+                )
+            )
+        if n_disp:
+            actions.append(
+                ft.TextButton(
+                    f"Спорные ({n_disp})",
+                    tooltip="Назначить категорию спорным операциям",
+                    on_click=lambda e: self.show("disp"),
+                )
+            )
+
+        self.warn_banner.content = ft.Row(actions, spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        self.warn_banner.visible = True
 
     def _build_chrome(self) -> None:
         self.dept_dd = ft.Dropdown(
@@ -184,6 +229,12 @@ class AnalizApp:
             padding=ft.Padding(left=12, right=12, top=10, bottom=10),
             bgcolor=ft.Colors.SURFACE_CONTAINER,
         )
+        self.warn_banner = ft.Container(
+            visible=False,
+            padding=ft.Padding(left=12, right=12, top=6, bottom=6),
+            bgcolor=ft.Colors.SECONDARY_CONTAINER,
+            content=ft.Container(),
+        )
 
     def _kpi_cards(self) -> ft.Control:
         k = self.session.kpi
@@ -221,8 +272,16 @@ class AnalizApp:
         )
 
     def _build_sidebar(self) -> ft.Control:
+        n_uncl, n_disp = self._class_issue_counts()
+
         def mk(i: int, key: str, lab: str, ic):
             selected = i == self.nav_index
+            label = lab
+            if key == "uncl" and n_uncl:
+                label = f"{lab} ({n_uncl})"
+            elif key == "disp" and n_disp:
+                label = f"{lab} ({n_disp})"
+            warn = (key == "uncl" and n_uncl > 0) or (key == "disp" and n_disp > 0)
 
             def go(_e=None, _i=i, _k=key):
                 self.nav_index = _i
@@ -231,13 +290,24 @@ class AnalizApp:
             return ft.Container(
                 content=ft.Row(
                     [
-                        ft.Icon(ic, size=18),
-                        ft.Text(lab, size=12, weight=ft.FontWeight.BOLD if selected else None),
+                        ft.Icon(
+                            ic,
+                            size=18,
+                            color=ft.Colors.SECONDARY if warn and not selected else None,
+                        ),
+                        ft.Text(
+                            label,
+                            size=12,
+                            weight=ft.FontWeight.BOLD if selected or warn else None,
+                            color=ft.Colors.SECONDARY if warn and not selected else None,
+                        ),
                     ],
                     spacing=8,
                 ),
                 padding=ft.Padding(left=10, right=10, top=8, bottom=8),
-                bgcolor=ft.Colors.PRIMARY_CONTAINER if selected else None,
+                bgcolor=ft.Colors.PRIMARY_CONTAINER if selected else (
+                    ft.Colors.SECONDARY_CONTAINER if warn else None
+                ),
                 border_radius=8,
                 ink=True,
                 on_click=go,
@@ -947,14 +1017,6 @@ class AnalizApp:
         self.show("emk")
 
     def _screen_uncl(self) -> ft.Control:
-        rows = self.session.unclassified_rows
-        lines = [f"Не классифицировано: {len(rows)}", "Дата | КВС | Код | КСГ | Услуга"]
-        for r in rows[:500]:
-            lines.append(
-                f"{r.get('Дата')} | {r.get('КВС')} | {r.get('Код')} | "
-                f"{r.get('КСГ_название')} | {r.get('Услуга')}"
-            )
-
         async def exp(_e):
             path = await self.file_picker.save_file(
                 file_name="неклассифицировано.xlsx",
@@ -975,11 +1037,144 @@ class AnalizApp:
             n = self.session.export_problem_codes(path)
             self._snack(f"Проблемных кодов: {n}")
 
+        def open_constructor(row: dict):
+            # Делаем “конструктор” максимально близким по смыслу к Tk:
+            # пользователь добавляет новую категорию в config.yaml, затем накопитель переклассифицируется.
+            from analyzers.category_registry import (
+                CategorySpec,
+                FORM_LINES,
+                suggest_keywords_from_name,
+            )
+
+            cats = list((self.session.summary_cfg.get("category_rows") or {}).keys())
+            anchor_options = cats[:]
+            anchor_default = cats[0] if cats else ""
+
+            name_default = str(row.get("КСГ_название") or row.get("Услуга") or "").strip()[:120]
+            codes_default = str(row.get("Код") or "").strip()
+            if not codes_default:
+                # иногда код в журнале отсутствует, тогда пользователь заполняет вручную
+                codes_default = ""
+
+            kw_default = ", ".join(suggest_keywords_from_name(name_default)) if name_default else ""
+
+            name_field = ft.TextField(
+                label="Название категории (как в отчёте)",
+                value=name_default,
+                width=540,
+            )
+            codes_field = ft.TextField(
+                label="Код(ы) (через запятую)",
+                value=codes_default,
+                width=540,
+            )
+            kw_field = ft.TextField(
+                label="Ключевые слова (через запятую)",
+                value=kw_default,
+                width=540,
+            )
+            kind_dd = ft.Dropdown(
+                label="Тип",
+                width=220,
+                options=[
+                    ft.dropdown.Option("plan", "Плановая"),
+                    ft.dropdown.Option("emergency", "Экстренная"),
+                ],
+                value="plan",
+            )
+            line_dd = ft.Dropdown(
+                label="Строка формы 4001",
+                width=220,
+                options=[ft.dropdown.Option(v, v) for v in FORM_LINES],
+                value="6",
+            )
+            hist_cb = ft.Checkbox(label="Гистология", value=False)
+            endo_cb = ft.Checkbox(label="Эндоскопия", value=False)
+            anchor_dd = ft.Dropdown(
+                label="Вставить после категории (якорь)",
+                width=340,
+                options=[ft.dropdown.Option(c, c) for c in anchor_options] if anchor_options else [],
+                value=anchor_default if anchor_options else "",
+            )
+
+            dlg = ft.AlertDialog(modal=True, title=ft.Text("Конструктор: добавить категорию"), actions=[])
+
+            def close(_e=None):
+                dlg.open = False
+                self.page.update()
+
+            async def apply(_e=None):
+                try:
+                    def _split_csv(s: str) -> list[str]:
+                        return [x.strip() for x in (s or "").replace(";", ",").split(",") if x.strip()]
+
+                    spec = CategorySpec(
+                        name=(name_field.value or "").strip(),
+                        codes=_split_csv(codes_field.value or ""),
+                        name_keywords=_split_csv(kw_field.value or ""),
+                        kind=str(kind_dd.value or "plan"),
+                        form_line=str(line_dd.value or "6"),
+                        histology=bool(hist_cb.value),
+                        endoscopic=bool(endo_cb.value),
+                        anchor_category=str(anchor_dd.value or ""),
+                    )
+                    res = self.session.add_category_and_reclassify(spec)
+                    self._snack(f"Категория добавлена: {res['added']}")
+                    if res.get("warnings"):
+                        self._snack("Есть предупреждения в лог/консоль")
+                    close()
+                    self.show("uncl")
+                except Exception as ex:
+                    self._snack(str(ex))
+
+            actions = [
+                ft.TextButton("Отмена", on_click=close),
+                ft.FilledButton("Добавить и переклассифицировать", on_click=apply),
+            ]
+            dlg.title = ft.Text("Конструктор: добавить категорию")
+            dlg.content = ft.Column(
+                [
+                    ft.Text(f"Операция: Дата {row.get('Дата')} | КВС {row.get('КВС')} | Код {row.get('Код')}", size=12),
+                    name_field,
+                    codes_field,
+                    kw_field,
+                    ft.Row([kind_dd, line_dd]),
+                    ft.Row([hist_cb, endo_cb]),
+                    anchor_dd,
+                    ft.Text(
+                        "После добавления категории накопитель переклассифицируется по ключевым словам.",
+                        size=12,
+                        color=ft.Colors.GREY_700,
+                    ),
+                ],
+                width=600,
+            )
+            dlg.actions = actions
+            dlg.actions_alignment = ft.MainAxisAlignment.END
+            self.page.show_dialog(dlg)
+
+        rows = self.session.unclassified_rows
+        list_view = ft.ListView(
+            expand=True,
+            spacing=2,
+            auto_scroll=True,
+            controls=[
+                ft.ListTile(
+                    title=ft.Text(f"{r.get('Дата')} | КВС {r.get('КВС')}"),
+                    subtitle=ft.Text(f"Код {r.get('Код')} | {r.get('КСГ_название')} | {r.get('Услуга')}"),
+                    on_click=lambda e, r=r: open_constructor(r),
+                )
+                for r in rows[:500]
+            ]
+            or [ft.Text("(пусто)")],
+        )
+
         return ft.Column(
             [
                 ft.Row(
                     [
                         ft.Text("Не классифицировано", size=20, weight=ft.FontWeight.BOLD),
+                        ft.Text(f"({len(rows)})", size=12, color=ft.Colors.GREY_700),
                         ft.OutlinedButton(
                             "Экспорт…",
                             tooltip="Сохранить неклассифицированные операции в файл",
@@ -992,26 +1187,104 @@ class AnalizApp:
                         ),
                     ]
                 ),
-                ft.Text("\n".join(lines), selectable=True, size=12),
+                list_view,
             ],
-            scroll=ft.ScrollMode.AUTO,
             expand=True,
         )
 
     def _screen_disp(self) -> ft.Control:
         rows = self.session.disputed_rows
-        lines = [f"Спорные: {len(rows)}", "Дата | КВС | Код | Категория | Кандидаты"]
-        for r in rows[:500]:
-            lines.append(
-                f"{r.get('Дата')} | {r.get('КВС')} | {r.get('Код')} | "
-                f"{r.get('Категория')} | {r.get('Кандидаты')}"
+
+        def open_constructor(row: dict):
+            from analyzers.surgery import lookup_category_meta
+
+            all_cats = list((self.session.summary_cfg.get("category_rows") or {}).keys())
+            ordered = []
+            for c in (str(row.get("Кандидаты") or "").split("|") if row.get("Кандидаты") else []):
+                c = str(c).strip()
+                if c and c not in ordered:
+                    ordered.append(c)
+            for c in all_cats:
+                if c and c not in ordered:
+                    ordered.append(c)
+            if row.get("Категория") and row.get("Категория") not in ordered:
+                ordered.insert(0, str(row.get("Категория")))
+
+            initial = str(row.get("Категория") or (ordered[0] if ordered else ""))
+
+            cat_dd = ft.Dropdown(
+                label="Категория для выбранной операции",
+                width=520,
+                options=[ft.dropdown.Option(c, c) for c in ordered] if ordered else [],
+                value=initial if initial else None,
             )
+
+            dlg = ft.AlertDialog(modal=True, title=ft.Text("Назначить категорию"), actions=[])
+
+            def close(_e=None):
+                dlg.open = False
+                self.page.update()
+
+            async def apply(_e=None):
+                try:
+                    cat = str(cat_dd.value or "").strip()
+                    if not cat:
+                        self._snack("Выберите категорию")
+                        return
+                    self.session.assign_disputed_category(int(row.get("StoreIndex")), cat)
+                    self._snack(f"Спорные: назначено «{cat}»")
+                    close()
+                    self.show("disp")
+                except Exception as ex:
+                    self._snack(str(ex))
+
+            dlg.content = ft.Column(
+                [
+                    ft.Text(
+                        f"Операция: Дата {row.get('Дата')} | КВС {row.get('КВС')} | Код {row.get('Код')}",
+                        size=12,
+                    ),
+                    cat_dd,
+                    ft.Text(
+                        "Назначение сохранится как ручное и не сбросится при правке ключей.",
+                        size=12,
+                        color=ft.Colors.GREY_700,
+                    ),
+                ],
+                width=560,
+            )
+            dlg.actions = [
+                ft.TextButton("Отмена", on_click=close),
+                ft.FilledButton("Назначить", on_click=apply),
+            ]
+            dlg.actions_alignment = ft.MainAxisAlignment.END
+            self.page.show_dialog(dlg)
+
+        list_view = ft.ListView(
+            expand=True,
+            spacing=2,
+            auto_scroll=True,
+            controls=[
+                ft.ListTile(
+                    title=ft.Text(f"{r.get('Дата')} | КВС {r.get('КВС')}"),
+                    subtitle=ft.Text(f"Код {r.get('Код')} | {r.get('Категория')} | кандидаты: {r.get('Кандидаты')}"),
+                    on_click=lambda e, r=r: open_constructor(r),
+                )
+                for r in rows[:500]
+            ]
+            or [ft.Text("(пусто)")],
+        )
+
         return ft.Column(
             [
-                ft.Text("Спорные по ключам", size=20, weight=ft.FontWeight.BOLD),
-                ft.Text("\n".join(lines), selectable=True, size=12),
+                ft.Row(
+                    [
+                        ft.Text("Спорные по ключам", size=20, weight=ft.FontWeight.BOLD),
+                        ft.Text(f"({len(rows)})", size=12, color=ft.Colors.GREY_700),
+                    ]
+                ),
+                list_view,
             ],
-            scroll=ft.ScrollMode.AUTO,
             expand=True,
         )
 

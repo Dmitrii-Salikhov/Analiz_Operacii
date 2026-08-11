@@ -16,7 +16,12 @@ import yaml
 from analyzers.app_paths import resolve_app_dir
 from analyzers.app_log import AppLog
 from analyzers.backup_utils import list_backups, restore_backup
-from analyzers.category_registry import save_config, shift_totals_rows_by_delta
+from analyzers.category_registry import (
+    CategorySpec,
+    register_category,
+    save_config,
+    shift_totals_rows_by_delta,
+)
 from analyzers.dept_config import (
     dept_summary_key,
     ensure_multi_dept_config,
@@ -45,7 +50,12 @@ from analyzers.op_quality_checks import (
 )
 from analyzers.problem_codes import build_problem_codes_table
 from analyzers.summary_writer import MONTH_RU, SummaryWriter, compute_month_weeks, read_sheet_weeks
-from analyzers.surgery import SurgeryAnalyzer, build_summary_tables
+from analyzers.surgery import (
+    SurgeryAnalyzer,
+    build_summary_tables,
+    lookup_category_meta,
+    reclassify_ops_by_keywords,
+)
 from analyzers.ui_settings import load_settings, save_settings
 from analyzers.updater import read_local_version
 from analyzers.write_verify import format_verify_message, verify_write_report
@@ -493,11 +503,12 @@ class AppSession:
     def _fill_unclassified(self, ops: pd.DataFrame) -> None:
         uncl = ops[ops["Категория"] == "Не классифицировано"]
         rows = []
-        for _, r in uncl.iterrows():
+        for store_index, r in uncl.iterrows():
             dt = r["Дата"]
             dt_s = dt.strftime("%d.%m.%Y") if hasattr(dt, "strftime") else str(dt)
             rows.append(
                 {
+                    "StoreIndex": int(store_index),
                     "Дата": dt_s,
                     "КВС": r.get("КВС"),
                     "Код": r.get("Код"),
@@ -514,11 +525,12 @@ class AppSession:
             self.disputed_rows = rows
             return
         disp = ops[ops["Спор_ключей"].fillna(False).astype(bool)]
-        for _, r in disp.iterrows():
+        for store_index, r in disp.iterrows():
             dt = r["Дата"]
             dt_s = dt.strftime("%d.%m.%Y") if hasattr(dt, "strftime") else str(dt)
             rows.append(
                 {
+                    "StoreIndex": int(store_index),
                     "Дата": dt_s,
                     "КВС": r.get("КВС"),
                     "Код": r.get("Код"),
@@ -659,12 +671,72 @@ class AppSession:
         return report
 
     def export_unclassified(self, out_path: str) -> int:
-        df = pd.DataFrame(self.unclassified_rows)
+        df = pd.DataFrame(self.unclassified_rows).drop(columns=["StoreIndex"], errors="ignore")
         if out_path.lower().endswith(".xlsx"):
             df.to_excel(out_path, index=False)
         else:
             df.to_csv(out_path, index=False, encoding="utf-8-sig")
         return len(df)
+
+    def add_category_and_reclassify(self, spec: CategorySpec) -> dict:
+        """
+        Добавляет категорию в config.yaml и переклассифицирует накопитель по ключевым словам.
+
+        Важно: это именно “конструктор” для вкладки «Не классифицировано».
+        """
+        updated_cfg, result = register_category(
+            self.app_dir / "config.yaml",
+            spec,
+            config=self.config,
+            summary_key=self.summary_key,
+        )
+        self.config = updated_cfg
+        self._sync_dept()
+
+        if not self.store.ops.empty:
+            self.store.ops = reclassify_ops_by_keywords(
+                self.store.ops, self._surgery_categories()
+            )
+
+        if not self.store.ops.empty:
+            self.run_analysis()
+
+        return {"added": result.name, "excel_row": result.excel_row, "warnings": result.warnings}
+
+    def assign_disputed_category(self, store_index: int, category_name: str) -> None:
+        """Ручное назначение категории для спорной операции (как в Tk-диалоге)."""
+        ops = self.store.ops
+        if ops.empty:
+            return
+        if store_index not in ops.index:
+            return
+        if "Ручная_категория" not in ops.columns:
+            ops["Ручная_категория"] = False
+        if "Спор_ключей" not in ops.columns:
+            ops["Спор_ключей"] = False
+        if "Спорные_категории" not in ops.columns:
+            ops["Спорные_категории"] = ""
+        if "Группа" not in ops.columns:
+            ops["Группа"] = ""
+        if "Строка_4001" not in ops.columns:
+            ops["Строка_4001"] = ""
+        if "Гистология" not in ops.columns:
+            ops["Гистология"] = False
+
+        meta = lookup_category_meta(self._surgery_categories(), category_name)
+
+        ops.at[store_index, "Категория"] = category_name
+        ops.at[store_index, "Спор_ключей"] = False
+        ops.at[store_index, "Спорные_категории"] = ""
+        ops.at[store_index, "Ручная_категория"] = True
+
+        if meta:
+            ops.at[store_index, "Группа"] = meta.get("group", ops.at[store_index, "Группа"])
+            ops.at[store_index, "Строка_4001"] = meta.get("line", ops.at[store_index, "Строка_4001"])
+            ops.at[store_index, "Гистология"] = bool(meta.get("histology", False))
+
+        self.store.ops = ops
+        self.run_analysis()
 
     def export_problem_codes(self, out_path: str) -> int:
         ops = self.get_view_ops()
