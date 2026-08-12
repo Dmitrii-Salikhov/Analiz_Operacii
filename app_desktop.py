@@ -2195,6 +2195,21 @@ class DesktopApp:
                 self.log_message(
                     f"Разделитель перед итогами: сдвиг totals_rows на {blank_delta:+d}"
                 )
+
+            patients_delta = int(report.get("patients_blank_delta") or 0)
+            if patients_delta:
+                totals = get_summary_cfg(self.config, summary_key=self.summary_key).setdefault(
+                    "totals_rows", {}
+                )
+                try:
+                    totals["patients"] = int(totals.get("patients", 0)) + patients_delta
+                except Exception:
+                    totals["patients"] = patients_delta
+                save_config(self.config, APP_DIR / "config.yaml")
+                self._sync_dept_context()
+                self.log_message(
+                    f"Разделитель между «Дети всего» и «Человек»: сдвиг patients_row на {patients_delta:+d}"
+                )
             months = ", ".join(report.get("months", {}).keys()) or "—"
             self.log_message(
                 f"Сводная обновлена: {months}, ячеек {report.get('cells_written', 0)}, "
@@ -3501,6 +3516,19 @@ class DesktopApp:
                 blank_delta = int(xrep.get("blank_delta") or 0)
                 if blank_delta:
                     shift_totals_rows_by_delta(self.config, blank_delta, summary_key=self.summary_key)
+                    save_config(self.config, APP_DIR / "config.yaml")
+                    self._sync_dept_context()
+
+                patients_delta = int(xrep.get("patients_blank_delta") or 0)
+                if patients_delta:
+                    # `patients_row` — строка метки «Человек» (в колонке B).
+                    totals = get_summary_cfg(self.config, summary_key=self.summary_key).setdefault(
+                        "totals_rows", {}
+                    )
+                    try:
+                        totals["patients"] = int(totals.get("patients", 0)) + patients_delta
+                    except Exception:
+                        totals["patients"] = patients_delta
                     save_config(self.config, APP_DIR / "config.yaml")
                     self._sync_dept_context()
                 msg = (

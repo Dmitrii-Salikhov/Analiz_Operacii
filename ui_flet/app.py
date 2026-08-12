@@ -1288,11 +1288,32 @@ class AnalizApp:
                 value=anchor_default if anchor_options else "",
             )
 
-            dlg = ft.AlertDialog(modal=True, title=ft.Text("Конструктор: добавить категорию"), actions=[])
+            assign_dd = ft.Dropdown(
+                label="Назначить существующую категорию (без добавления новой)",
+                width=540,
+                options=[ft.dropdown.Option(c, c) for c in cats] if cats else [],
+                value=cats[0] if cats else None,
+            )
+
+            dlg = ft.AlertDialog(modal=True, title=ft.Text("Назначить / добавить категорию"), actions=[])
 
             def close(_e=None):
                 dlg.open = False
                 self.page.update()
+
+            async def assign_existing(_e=None):
+                try:
+                    store_index = int(row.get("StoreIndex"))
+                    cat = str(assign_dd.value or "").strip()
+                    if not cat:
+                        self._snack("Выберите категорию")
+                        return
+                    self.session.assign_unclassified_category(store_index, cat)
+                    self._snack(f"Назначено: «{cat}»")
+                    close()
+                    self.show("uncl")
+                except Exception as ex:
+                    self._snack(str(ex))
 
             async def apply(_e=None):
                 try:
@@ -1321,12 +1342,23 @@ class AnalizApp:
 
             actions = [
                 ft.TextButton("Отмена", on_click=close),
-                ft.FilledButton("Добавить в config и Excel", on_click=apply),
+                ft.FilledButton("Назначить существующую", on_click=assign_existing),
+                ft.FilledButton("Добавить новую категорию", on_click=apply),
             ]
-            dlg.title = ft.Text("Конструктор: добавить категорию")
             dlg.content = ft.Column(
                 [
                     ft.Text(f"Операция: Дата {row.get('Дата')} | КВС {row.get('КВС')} | Код {row.get('Код')}", size=12),
+                    ft.Text(
+                        "Вариант 1: назначьте существующую категорию (без изменений Excel-структуры).",
+                        size=12,
+                        color=ft.Colors.GREY_700,
+                    ),
+                    assign_dd,
+                    ft.Text(
+                        "Вариант 2: если нужной категории нет — создайте новую ниже.",
+                        size=12,
+                        color=ft.Colors.GREY_700,
+                    ),
                     name_field,
                     codes_field,
                     kw_field,
@@ -1334,7 +1366,7 @@ class AnalizApp:
                     ft.Row([hist_cb, endo_cb]),
                     anchor_dd,
                     ft.Text(
-                        "Категория пишется в config и вставляется строкой в сводную Excel "
+                        "Новая категория будет записана в config и вставлена строкой в Excel "
                         "(закройте файл в Excel). Затем накопитель переклассифицируется по ключам.",
                         size=12,
                         color=ft.Colors.GREY_700,
@@ -1434,7 +1466,11 @@ class AnalizApp:
             dlg.content = ft.Column(
                 [
                     ft.Text(
-                        f"Операция: Дата {row.get('Дата')} | КВС {row.get('КВС')} | Код {row.get('Код')}",
+                        f"Операция: {row.get('Услуга')}",
+                        size=12,
+                    ),
+                    ft.Text(
+                        f"Дата {row.get('Дата')} | КВС {row.get('КВС')} | Код {row.get('Код')}",
                         size=12,
                     ),
                     cat_dd,
@@ -1442,6 +1478,11 @@ class AnalizApp:
                         "Назначение сохранится как ручное и не сбросится при правке ключей.",
                         size=12,
                         color=ft.Colors.GREY_700,
+                    ),
+                    ft.Text("Предлагаемые категории:", size=12, weight=ft.FontWeight.BOLD),
+                    ft.Column(
+                        [ft.Text(c) for c in ordered[:10]] + ([ft.Text(f"... +{max(0, len(ordered)-10)}")]),
+                        spacing=2,
                     ),
                 ],
                 width=560,
@@ -1460,7 +1501,24 @@ class AnalizApp:
             controls=[
                 ft.ListTile(
                     title=ft.Text(f"{r.get('Дата')} | КВС {r.get('КВС')}"),
-                    subtitle=ft.Text(f"Код {r.get('Код')} | {r.get('Категория')} | кандидаты: {r.get('Кандидаты')}"),
+                    subtitle=ft.Column(
+                        [
+                            ft.Text(f"Код {r.get('Код')}"),
+                            ft.Text(f"Операция: {r.get('Услуга')}"),
+                            ft.Text(f"Текущая: {r.get('Категория')}"),
+                            ft.Text("Кандидаты:", weight=ft.FontWeight.BOLD),
+                            ft.Column(
+                                [
+                                    ft.Text(c)
+                                    for c in (
+                                        [x.strip() for x in str(r.get("Кандидаты") or "").split("|") if x.strip()]
+                                    )[:6]
+                                ],
+                                spacing=1,
+                            ),
+                        ],
+                        spacing=1,
+                    ),
                     on_click=lambda e, r=r: open_constructor(r),
                 )
                 for r in rows[:500]

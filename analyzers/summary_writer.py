@@ -11,6 +11,7 @@ import openpyxl
 import pandas as pd
 
 from analyzers.form_4001 import write_form_4001
+from analyzers.summary_layout import _find_label_row
 
 
 MONTH_RU = {
@@ -173,6 +174,7 @@ class SummaryWriter:
             "write_weeks": write_weeks,
             "write_form": write_form,
             "blank_delta": 0,
+            "patients_blank_delta": 0,
         }
         if report_bak:
             report["backup"] = report_bak
@@ -182,16 +184,36 @@ class SummaryWriter:
             _classify_sheet,
             _find_label_row,
             ensure_one_blank_before_totals,
+            ensure_one_blank_between_labels,
         )
 
+        protected_last_category_row: Optional[int] = None
+        if self.category_rows:
+            try:
+                protected_last_category_row = max(int(r) for r in self.category_rows.values())
+            except Exception:
+                protected_last_category_row = None
+
         blank_delta_set = False
+        patients_blank_delta_set = False
         month_name_set = set(self.sheet_names.values())
         for sn in list(wb.sheetnames):
             ws = wb[sn]
             if sn not in month_name_set and not _classify_sheet(sn):
                 if not _find_label_row(ws, "Всего операций"):
                     continue
-            gap = ensure_one_blank_before_totals(ws)
+            gap = ensure_one_blank_before_totals(
+                ws,
+                protected_last_category_row=protected_last_category_row,
+            )
+            # Дополнительно удерживаем разделитель между «Дети всего» и «Человек».
+            # Это важно для стабильных сдвигов при физическом insert/delete строк.
+            pgap = ensure_one_blank_between_labels(
+                ws, top_label="Дети всего", bottom_label="Человек"
+            )
+            if not patients_blank_delta_set and (pgap.get("inserted") or pgap.get("deleted")):
+                report["patients_blank_delta"] = int(pgap.get("delta") or 0)
+                patients_blank_delta_set = True
             if not blank_delta_set:
                 report["blank_delta"] = int(gap.get("delta") or 0)
                 blank_delta_set = True
@@ -237,6 +259,12 @@ class SummaryWriter:
             if not sheet_name or sheet_name not in wb.sheetnames:
                 continue
             ws = wb[sheet_name]
+            # На некоторых сводных строка «Дети всего» / «Человек» может быть
+            # сдвинута относительно `config.yaml` (например после ручных правок
+            # или частичного физического вставления строк). Поэтому на каждом листе
+            # находим фактические метки в колонке B.
+            children_row_ws = _find_label_row(ws, "Дети всего") or self.children_row
+            patients_row_ws = _find_label_row(ws, "Человек") or self.patients_row
             month_ops = ops[ops["_month"] == month] if not ops.empty else pd.DataFrame()
 
             weeks = read_sheet_weeks(ws)
@@ -272,8 +300,17 @@ class SummaryWriter:
                         report["unmapped_dates"] += 1
 
                 for col in cols_touched:
-                    self._clear_week_column(ws, col)
-                    report["cells_written"] += self._fill_week_column(ws, col, month_ops, weeks)
+                    self._clear_week_column(
+                        ws, col, children_row=children_row_ws, patients_row=patients_row_ws
+                    )
+                    report["cells_written"] += self._fill_week_column(
+                        ws,
+                        col,
+                        month_ops,
+                        weeks,
+                        children_row=children_row_ws,
+                        patients_row=patients_row_ws,
+                    )
 
                 title = f"{self.department} за {MONTH_RU.get(int(month), '')} {year}".strip()
                 if self.department:
@@ -330,13 +367,22 @@ class SummaryWriter:
         report["output"] = str(out)
         return report
 
-    def _clear_week_column(self, ws, col: int):
+    def _clear_week_column(self, ws, col: int, *, children_row: int, patients_row: int):
         for row in self.category_rows.values():
             ws.cell(row, col).value = None
-        ws.cell(self.children_row, col).value = None
-        ws.cell(self.patients_row, col).value = None
+        ws.cell(children_row, col).value = None
+        ws.cell(patients_row, col).value = None
 
-    def _fill_week_column(self, ws, col: int, month_ops: pd.DataFrame, weeks: List[Tuple[date, date]]) -> int:
+    def _fill_week_column(
+        self,
+        ws,
+        col: int,
+        month_ops: pd.DataFrame,
+        weeks: List[Tuple[date, date]],
+        *,
+        children_row: int,
+        patients_row: int,
+    ) -> int:
         """Пишет счётчики по категориям; 0 не ставим — ячейка остаётся пустой."""
         idx = col - 3
         if idx < 0 or idx >= len(weeks):
@@ -363,7 +409,7 @@ class SummaryWriter:
             children = int(week_ops.loc[week_ops["Возраст"].fillna(99) < 18, "КВС"].nunique())
             patients = int(week_ops["КВС"].nunique())
         # итоги «Дети» / «Человек»: 0 тоже не пишем
-        ws.cell(self.children_row, col).value = children if children else None
-        ws.cell(self.patients_row, col).value = patients if patients else None
+        ws.cell(children_row, col).value = children if children else None
+        ws.cell(patients_row, col).value = patients if patients else None
         written += 2
         return written

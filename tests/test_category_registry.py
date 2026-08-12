@@ -161,10 +161,12 @@ def test_delete_row_from_summary(tmp_path: Path):
     wb2 = openpyxl.load_workbook(path)
     ws2 = wb2["Январь"]
     assert ws2["B37"].value == "Биопсия"
-    # строка 38 удалена → «Всего» с 40-й стало на 39-й, пустая-разделитель сохранена
+    # строка 38 удалена → «Всего» с 40-й стало на 39-й,
+    # но затем нормализация удерживает 2 пустые строки перед итогами
     assert ws2["B38"].value in (None, "")
-    assert ws2["B39"].value == "Всего операций"
-    assert "C38" not in str(ws2.cell(39, 3).value or "")
+    assert ws2["B39"].value in (None, "")
+    assert ws2["B40"].value == "Всего операций"
+    assert "C38" not in str(ws2.cell(40, 3).value or "")
     cfg = _minimal_config()
     with pytest.raises(CategoryRegistryError):
         apply_category_to_config(
@@ -236,9 +238,10 @@ def test_physical_insert_and_colors(tmp_path: Path):
     wb2 = openpyxl.load_workbook(path)
     ws2 = wb2["Январь"]
     assert ws2["B38"].value == "Мирингопластика"
-    # после вставки и нормализации — ровно одна пустая перед «Всего»
+    # после вставки и нормализации — ровно две пустые перед «Всего»
     assert ws2["B39"].value in (None, "")
-    assert ws2["B40"].value == "Всего операций"
+    assert ws2["B40"].value in (None, "")
+    assert ws2["B41"].value == "Всего операций"
     assert "+C38" in str(ws2["C43"].value) or "C38" in str(ws2["C43"].value) or True
     # план на строке после сдвига
     plan_row = None
@@ -289,12 +292,13 @@ def test_ensure_one_blank_before_totals_inserts(tmp_path: Path):
     ws["B38"] = "Всего операций"
     ws["C38"] = "=SUM(C4:C37)"
     gap = ensure_one_blank_before_totals(ws)
-    assert gap["inserted"] == 1
-    assert gap["delta"] == 1
+    assert gap["inserted"] == 2
+    assert gap["delta"] == 2
     assert ws["B37"].value == "Биопсия"
     assert ws["B38"].value in (None, "")
-    assert ws["B39"].value == "Всего операций"
-    assert ws["C39"].value == "=SUM(C4:C37)"
+    assert ws["B39"].value in (None, "")
+    assert ws["B40"].value == "Всего операций"
+    assert ws["C40"].value == "=SUM(C4:C37)"
 
 
 def test_ensure_one_blank_before_totals_trims_extras(tmp_path: Path):
@@ -303,14 +307,56 @@ def test_ensure_one_blank_before_totals_trims_extras(tmp_path: Path):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws["B37"] = "Биопсия"
-    # две пустые (38, 39) перед итогами на 40 → оставить одну
-    ws["B40"] = "Всего операций"
+    # gap=3 (38,39,40) перед итогами на 41 → удалить одну строку
+    ws["B41"] = "Всего операций"
     gap = ensure_one_blank_before_totals(ws)
     assert gap["deleted"] == 1
     assert gap["delta"] == -1
     assert ws["B37"].value == "Биопсия"
     assert ws["B38"].value in (None, "")
-    assert ws["B39"].value == "Всего операций"
+    assert ws["B39"].value in (None, "")
+    assert ws["B40"].value == "Всего операций"
+
+
+def test_ensure_one_blank_before_totals_protected_row_avoids_deleting_categories(tmp_path: Path):
+    """
+    Регрессия: если последняя категория в шаблоне в колонке B временно пустая,
+    прежняя логика могла удалить строку категории при нормализации разделителя.
+    """
+    from analyzers.summary_layout import ensure_one_blank_before_totals
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["B37"] = "А"
+    ws["B40"] = "Всего операций"
+    # категория на 38, но в шаблоне B38 пустая (например после частичной вставки)
+    ws["B39"] = None
+
+    gap = ensure_one_blank_before_totals(ws, protected_last_category_row=38)
+    # Если последняя категория в реальности на 38, то нужно 2 пустые строки:
+    # между 38 и 40 сейчас только одна пустая (39), поэтому вставим одну строку.
+    assert gap["deleted"] == 0
+    assert gap["inserted"] == 1
+    assert ws["B39"].value in (None, "")
+    assert ws["B40"].value in (None, "")
+    assert ws["B41"].value == "Всего операций"
+
+
+def test_ensure_one_blank_between_labels_inserts_gap_when_missing(tmp_path: Path):
+    """
+    Между «Дети всего» и «Человек» должна быть ровно одна пустая строка в колонке B.
+    """
+    from analyzers.summary_layout import ensure_one_blank_between_labels
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["B40"] = "Дети всего"
+    ws["B41"] = "Человек"
+    gap = ensure_one_blank_between_labels(ws, top_label="Дети всего", bottom_label="Человек")
+    assert gap["inserted"] == 1
+    assert gap["delta"] == 1
+    assert ws["B41"].value in (None, "")
+    assert ws["B42"].value == "Человек"
 
 
 def test_config_only_register_desyncs_excel_labels(tmp_path: Path):
@@ -396,6 +442,7 @@ def test_register_plus_physical_insert_keeps_label(tmp_path: Path):
     wb2 = openpyxl.load_workbook(xlsx)
     ws2 = wb2["Январь"]
     assert ws2["B38"].value == "Мирингопластика"
-    # одна пустая перед «Всего»
+    # две пустые перед «Всего»
     assert ws2["B39"].value in (None, "")
-    assert ws2["B40"].value == "Всего операций"
+    assert ws2["B40"].value in (None, "")
+    assert ws2["B41"].value == "Всего операций"

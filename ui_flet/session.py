@@ -645,6 +645,16 @@ class AppSession:
             shift_totals_rows_by_delta(self.config, blank_delta, summary_key=self.summary_key)
             save_config(self.config, self.app_dir / "config.yaml")
             self._sync_dept()
+
+        patients_delta = int(report.get("patients_blank_delta") or 0)
+        if patients_delta:
+            totals = self.summary_cfg.setdefault("totals_rows", {})
+            try:
+                totals["patients"] = int(totals.get("patients", 0)) + patients_delta
+            except Exception:
+                totals["patients"] = patients_delta
+            save_config(self.config, self.app_dir / "config.yaml")
+            self._sync_dept()
         if write_weeks:
             try:
                 vres = verify_write_report(path, report)
@@ -763,6 +773,18 @@ class AppSession:
                 )
                 save_config(self.config, self.app_dir / "config.yaml")
                 self._sync_dept()
+
+            patients_delta = int(excel_report.get("patients_blank_delta") or 0)
+            if patients_delta:
+                summary_cfg = self.summary_cfg
+                # `patients_row` — строка метки «Человек» в колонке B.
+                totals = summary_cfg.setdefault("totals_rows", {})
+                try:
+                    totals["patients"] = int(totals.get("patients", 0)) + patients_delta
+                except Exception:
+                    totals["patients"] = patients_delta
+                save_config(self.config, self.app_dir / "config.yaml")
+                self._sync_dept()
             self.log(
                 f"В сводную вставлена «{result.name}» → строка {result.excel_row} "
                 f"(месяцы: {len(excel_report.get('sheets') or [])})"
@@ -810,6 +832,50 @@ class AppSession:
         ops.at[store_index, "Спорные_категории"] = ""
         ops.at[store_index, "Ручная_категория"] = True
 
+        if meta:
+            ops.at[store_index, "Группа"] = meta.get("group", ops.at[store_index, "Группа"])
+            ops.at[store_index, "Строка_4001"] = meta.get("line", ops.at[store_index, "Строка_4001"])
+            ops.at[store_index, "Гистология"] = bool(meta.get("histology", False))
+
+        self.store.ops = ops
+        self.run_analysis()
+
+    def assign_unclassified_category(self, store_index: int, category_name: str) -> None:
+        """
+        Ручное назначение категории для операции из вкладки «Не классифицировано».
+
+        Важно: отмечаем `Ручная_категория=True`, чтобы `reclassify_ops_by_keywords`
+        не перетёр выбранную пользователем категорию.
+        """
+        ops = self.store.ops
+        if ops.empty:
+            return
+        if store_index not in ops.index:
+            return
+
+        if "Ручная_категория" not in ops.columns:
+            ops["Ручная_категория"] = False
+        if "Спор_ключей" not in ops.columns:
+            ops["Спор_ключей"] = False
+        if "Спорные_категории" not in ops.columns:
+            ops["Спорные_категории"] = ""
+        if "Группа" not in ops.columns:
+            ops["Группа"] = ""
+        if "Строка_4001" not in ops.columns:
+            ops["Строка_4001"] = ""
+        if "Ручная_категория" not in ops.columns:
+            ops["Ручная_категория"] = False
+        if "Гистология" not in ops.columns:
+            ops["Гистология"] = False
+
+        meta = lookup_category_meta(self._surgery_categories(), category_name)
+
+        ops.at[store_index, "Категория"] = category_name
+        ops.at[store_index, "Спор_ключей"] = False
+        ops.at[store_index, "Спорные_категории"] = ""
+        ops.at[store_index, "Ручная_категория"] = True
+
+        # подтягиваем метаданные категории, чтобы Excel заполнился корректно
         if meta:
             ops.at[store_index, "Группа"] = meta.get("group", ops.at[store_index, "Группа"])
             ops.at[store_index, "Строка_4001"] = meta.get("line", ops.at[store_index, "Строка_4001"])

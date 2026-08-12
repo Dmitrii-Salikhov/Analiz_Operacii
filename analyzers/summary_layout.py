@@ -260,31 +260,56 @@ def _last_category_row_before(ws, totals_row: int) -> Optional[int]:
     return None
 
 
-def ensure_one_blank_before_totals(ws) -> dict:
+def ensure_one_blank_before_totals(
+    ws,
+    protected_last_category_row: Optional[int] = None,
+    *,
+    desired_blank_count: int = 2,
+) -> dict:
     """
-    Между последней операцией и «Всего операций» — ровно одна пустая строка.
+    Между последней операцией и «Всего операций» — ровно `desired_blank_count` пустых строк.
     Возвращает {inserted, deleted, blank_at, delta} (delta = inserted - deleted).
     """
+    desired_blank_count = int(desired_blank_count)
+    if desired_blank_count < 0:
+        desired_blank_count = 0
+
     result = {"inserted": 0, "deleted": 0, "blank_at": None, "delta": 0}
     totals_row = _find_label_row(ws, "Всего операций")
     if not totals_row:
         return result
-    last_cat = _last_category_row_before(ws, totals_row)
+    if protected_last_category_row is not None:
+        try:
+            p = int(protected_last_category_row)
+        except (TypeError, ValueError):
+            p = None
+        # Если защита выглядит валидной, не полагаемся на значения в колонке B:
+        # иначе можно удалить строки категорий, где в шаблоне текст пустой.
+        if p is not None and 3 <= p < int(totals_row):
+            last_cat = p
+        else:
+            last_cat = _last_category_row_before(ws, totals_row)
+    else:
+        last_cat = _last_category_row_before(ws, totals_row)
     if last_cat is None:
         return result
     gap = totals_row - last_cat - 1
-    if gap == 1:
-        result["blank_at"] = last_cat + 1
+    if gap == desired_blank_count:
+        # blank_at — первая пустая строка в разрыве
+        result["blank_at"] = last_cat + 1 if desired_blank_count else None
         return result
-    if gap == 0:
-        ws.insert_rows(totals_row, amount=1)
-        bump_sheet_formulas(ws, totals_row, 1)
-        bump_chart_refs(ws, totals_row, 1)
-        result["inserted"] = 1
-        result["delta"] = 1
+    # gap < desired — вставлять строки прямо перед итогами
+    if gap < desired_blank_count:
+        need = desired_blank_count - gap
+        ws.insert_rows(totals_row, amount=need)
+        bump_sheet_formulas(ws, totals_row, need)
+        bump_chart_refs(ws, totals_row, need)
+        result["inserted"] = need
+        result["delta"] = need
         result["blank_at"] = totals_row
         return result
-    # gap > 1 — удалять пустые сразу над итогами, пока не останется одна
+
+    # gap > desired — удалять пустые строки над итогами, пока не станет ровно desired
     while True:
         totals_row = _find_label_row(ws, "Всего операций")
         if not totals_row:
@@ -293,10 +318,11 @@ def ensure_one_blank_before_totals(ws) -> dict:
         if last_cat is None:
             break
         gap = totals_row - last_cat - 1
-        if gap <= 1:
+        if gap <= desired_blank_count:
             break
         del_row = totals_row - 1
         v = ws.cell(del_row, 2).value
+        # Удаляем только реально пустые строки (иначе можно срезать категорию)
         if v is not None and str(v).strip():
             break
         ws.delete_rows(del_row, amount=1)
@@ -304,10 +330,74 @@ def ensure_one_blank_before_totals(ws) -> dict:
         bump_chart_refs(ws, del_row + 1, -1)
         result["deleted"] += 1
         result["delta"] -= 1
+
+    # диагноситика: восстановить blank_at
     totals_row = _find_label_row(ws, "Всего операций")
     last_cat = _last_category_row_before(ws, totals_row) if totals_row else None
-    if last_cat is not None:
+    if last_cat is not None and desired_blank_count:
         result["blank_at"] = last_cat + 1
+    return result
+
+
+def ensure_one_blank_between_labels(
+    ws,
+    *,
+    top_label: str,
+    bottom_label: str,
+) -> dict:
+    """
+    На участке между строками с метками `top_label` и `bottom_label`
+    должна быть ровно одна пустая строка (проверяем по колонке B).
+    Возвращает {inserted, deleted, blank_at, delta}.
+    """
+    result = {"inserted": 0, "deleted": 0, "blank_at": None, "delta": 0}
+    top_row = _find_label_row(ws, top_label)
+    bottom_row = _find_label_row(ws, bottom_label)
+    if not top_row or not bottom_row:
+        return result
+    if bottom_row <= top_row:
+        return result
+
+    gap = bottom_row - top_row - 1
+    if gap == 1:
+        result["blank_at"] = top_row + 1
+        return result
+
+    if gap == 0:
+        ws.insert_rows(bottom_row, amount=1)
+        bump_sheet_formulas(ws, bottom_row, 1)
+        bump_chart_refs(ws, bottom_row, 1)
+        result["inserted"] = 1
+        result["blank_at"] = bottom_row
+        result["delta"] = 1
+        return result
+
+    # gap > 1 — удаляем лишние пустые строки прямо над bottom_label
+    while True:
+        top_row = _find_label_row(ws, top_label)
+        bottom_row = _find_label_row(ws, bottom_label)
+        if not top_row or not bottom_row or bottom_row <= top_row:
+            break
+        gap = bottom_row - top_row - 1
+        if gap <= 1:
+            break
+        del_row = bottom_row - 1
+        v = ws.cell(del_row, 2).value
+        if v is not None and str(v).strip():
+            # не трогаем строки, где B не пустая (на всякий случай)
+            break
+        ws.delete_rows(del_row, amount=1)
+        bump_sheet_formulas(ws, del_row + 1, -1)
+        bump_chart_refs(ws, del_row + 1, -1)
+        result["deleted"] += 1
+        result["delta"] -= 1
+
+    # recalculated blank_at (не критично для логики, но удобно для диагностики)
+    top_row = _find_label_row(ws, top_label)
+    bottom_row = _find_label_row(ws, bottom_label)
+    if top_row and bottom_row and bottom_row > top_row:
+        if bottom_row - top_row - 1 >= 1:
+            result["blank_at"] = top_row + 1
     return result
 
 
@@ -663,6 +753,7 @@ def add_category_row_to_summary(
         "blank_inserted": 0,
         "blank_deleted": 0,
         "blank_delta": 0,
+        "patients_blank_delta": 0,
     }
 
     if backup:
@@ -675,6 +766,7 @@ def add_category_row_to_summary(
 
     # --- месячные листы ---
     blank_delta_set = False
+    patients_blank_delta_set = False
     for name in month_sheets:
         ws = wb[name]
         ws.insert_rows(insert_at, amount=1)
@@ -701,6 +793,11 @@ def add_category_row_to_summary(
         if not blank_delta_set:
             report["blank_delta"] = gap["delta"]
             blank_delta_set = True
+
+        pgap = ensure_one_blank_between_labels(ws, top_label="Дети всего", bottom_label="Человек")
+        if not patients_blank_delta_set:
+            report["patients_blank_delta"] = int(pgap.get("delta") or 0)
+            patients_blank_delta_set = True
         report["sheets"].append(name)
 
     # --- ОБЩАЯ / График Общий ---
@@ -739,6 +836,11 @@ def add_category_row_to_summary(
         if not blank_delta_set:
             report["blank_delta"] = gap["delta"]
             blank_delta_set = True
+
+        pgap = ensure_one_blank_between_labels(ws, top_label="Дети всего", bottom_label="Человек")
+        if not patients_blank_delta_set:
+            report["patients_blank_delta"] = int(pgap.get("delta") or 0)
+            patients_blank_delta_set = True
         report["overview"].append(sheet_name)
 
     wb.save(path)
@@ -880,6 +982,7 @@ def delete_category_row_from_summary(
         "blank_inserted": 0,
         "blank_deleted": 0,
         "blank_delta": 0,
+        "patients_blank_delta": 0,
     }
     if backup:
         bak = make_backup(path, keep=backup_keep)
@@ -897,6 +1000,7 @@ def delete_category_row_from_summary(
             targets.append(sn)
 
     blank_delta_set = False
+    patients_blank_delta_set = False
     for name in targets:
         ws = wb[name]
         report["charts_removed"] += _remove_chart_series_for_row(ws, delete_at)
@@ -910,6 +1014,13 @@ def delete_category_row_from_summary(
         if not blank_delta_set:
             report["blank_delta"] = gap["delta"]
             blank_delta_set = True
+
+        gap2 = ensure_one_blank_between_labels(
+            ws, top_label="Дети всего", bottom_label="Человек"
+        )
+        if not patients_blank_delta_set:
+            report["patients_blank_delta"] = int(gap2.get("delta") or 0)
+            patients_blank_delta_set = True
         if name in month_sheets:
             report["sheets"].append(name)
         else:
@@ -941,6 +1052,7 @@ def ensure_blank_separator_in_summary(
         "blank_inserted": 0,
         "blank_deleted": 0,
         "blank_delta": 0,
+        "patients_blank_delta": 0,
     }
     if backup:
         bak = make_backup(path, keep=backup_keep)
@@ -966,6 +1078,7 @@ def ensure_blank_separator_in_summary(
                 targets.append(sn)
 
     blank_delta_set = False
+    patients_blank_delta_set = False
     for name in targets:
         ws = wb[name]
         gap = ensure_one_blank_before_totals(ws)
@@ -978,6 +1091,11 @@ def ensure_blank_separator_in_summary(
         if not blank_delta_set:
             report["blank_delta"] = gap["delta"]
             blank_delta_set = True
+
+        gap2 = ensure_one_blank_between_labels(ws, top_label="Дети всего", bottom_label="Человек")
+        if not patients_blank_delta_set:
+            report["patients_blank_delta"] = int(gap2.get("delta") or 0)
+            patients_blank_delta_set = True
         if name in month_sheets or (sheet_names and name in month_sheets):
             report["sheets"].append(name)
         elif _classify_sheet(name):
