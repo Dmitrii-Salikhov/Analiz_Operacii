@@ -12,8 +12,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # (путь от корня репозитория, диапазоны строк inclusive)
+# Регионы: разделители Excel, insert категории, сдвиг высот строк, uncl/session
 V117_REGIONS: list[tuple[str, list[tuple[int, int]]]] = [
-    ("analyzers/summary_layout.py", [(263, 410), (721, 847)]),
+    (
+        "analyzers/summary_layout.py",
+        [
+            (99, 215),   # shift_row_dimensions / fix_patients_row_height / sheet_insert|delete
+            (382, 529),  # ensure_one_blank_before_totals / between_labels
+            (848, 976),  # add_category_row_to_summary
+        ],
+    ),
     ("analyzers/summary_writer.py", [(182, 222)]),
     ("ui_flet/session.py", [(701, 806), (843, 885)]),
 ]

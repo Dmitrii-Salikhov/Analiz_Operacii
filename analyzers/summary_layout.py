@@ -96,6 +96,125 @@ def bump_sheet_formulas(ws, insert_at: int, amount: int = 1) -> int:
     return changed
 
 
+def shift_row_dimensions(ws, at: int, amount: int = 1) -> int:
+    """
+    openpyxl insert_rows/delete_rows двигает ячейки, но не row_dimensions.
+    Без этого высота «прилипает» к номеру строки: после вставки над блоком
+    итогов height=51 у «Человек» оказывается у «Дети всего».
+    amount > 0 — после insert_rows; amount < 0 — после delete_rows (|amount| строк с `at`).
+    """
+    if not amount:
+        return 0
+    dims = ws.row_dimensions
+    snapshot: Dict[int, tuple] = {}
+    for key in list(dims.keys()):
+        try:
+            r = int(key)
+        except (TypeError, ValueError):
+            continue
+        rd = dims[key]
+        snapshot[r] = (rd.height, bool(getattr(rd, "customHeight", False)))
+
+    if not snapshot:
+        return 0
+
+    # Сбрасываем затронутые, затем расставляем заново
+    moved = 0
+    if amount > 0:
+        for r in sorted(snapshot.keys(), reverse=True):
+            if r < at:
+                continue
+            h, custom = snapshot[r]
+            old = dims[r]
+            old.height = None
+            try:
+                old.customHeight = False
+            except Exception:
+                pass
+            new_r = r + amount
+            dims[new_r].height = h
+            try:
+                dims[new_r].customHeight = custom
+            except Exception:
+                pass
+            moved += 1
+        for r in range(at, at + amount):
+            dims[r].height = None
+            try:
+                dims[r].customHeight = False
+            except Exception:
+                pass
+    else:
+        n = -amount
+        for r in sorted(snapshot.keys()):
+            h, custom = snapshot[r]
+            if at <= r < at + n:
+                dims[r].height = None
+                try:
+                    dims[r].customHeight = False
+                except Exception:
+                    pass
+                moved += 1
+            elif r >= at + n:
+                dims[r].height = None
+                try:
+                    dims[r].customHeight = False
+                except Exception:
+                    pass
+                new_r = r - n
+                dims[new_r].height = h
+                try:
+                    dims[new_r].customHeight = custom
+                except Exception:
+                    pass
+                moved += 1
+    return moved
+
+
+def fix_patients_row_height(ws) -> bool:
+    """
+    В шаблоне ЛОР высота ~51 у строки «Человек», не у «Дети всего».
+    После insert_rows без сдвига dimensions высота остаётся на старом номере —
+    метка «Дети» визуально раздувается. Переносим высоту на «Человек».
+    """
+    children = _find_label_row(ws, "Дети всего")
+    patients = _find_label_row(ws, "Человек")
+    if not children or not patients:
+        return False
+    h_c = ws.row_dimensions[children].height
+    h_p = ws.row_dimensions[patients].height
+    try:
+        hc = float(h_c) if h_c is not None else 0.0
+    except (TypeError, ValueError):
+        hc = 0.0
+    try:
+        hp = float(h_p) if h_p is not None else 0.0
+    except (TypeError, ValueError):
+        hp = 0.0
+    # «высокая» строка оказалась у Детей, у Человек — обычная
+    if hc >= 30 and hc > hp + 1:
+        ws.row_dimensions[patients].height = h_c
+        ws.row_dimensions[children].height = None
+        try:
+            ws.row_dimensions[children].customHeight = False
+        except Exception:
+            pass
+        return True
+    return False
+
+
+def sheet_insert_rows(ws, idx: int, amount: int = 1) -> None:
+    """insert_rows + сдвиг высот строк."""
+    ws.insert_rows(idx, amount=amount)
+    shift_row_dimensions(ws, idx, amount)
+
+
+def sheet_delete_rows(ws, idx: int, amount: int = 1) -> None:
+    """delete_rows + сдвиг высот строк."""
+    shift_row_dimensions(ws, idx, -amount)
+    ws.delete_rows(idx, amount=amount)
+
+
 def bump_chart_refs(ws, insert_at: int, amount: int = 1) -> int:
     changed = 0
     for chart in getattr(ws, "_charts", []) or []:
@@ -269,6 +388,11 @@ def ensure_one_blank_before_totals(
     """
     Между последней операцией и «Всего операций» — ровно `desired_blank_count` пустых строк.
     Возвращает {inserted, deleted, blank_at, delta} (delta = inserted - deleted).
+
+    `protected_last_category_row` — только защита от удаления (не трогать строки ≤ protected).
+    Для расчёта gap / insert всегда берём последнюю непустую метку в колонке B:
+    иначе «фантомные» category_rows из config (строки без названия в Excel) дают
+    gap=0 и вставляют лишние пустые строки вместо прописывания операций.
     """
     desired_blank_count = int(desired_blank_count)
     if desired_blank_count < 0:
@@ -278,19 +402,18 @@ def ensure_one_blank_before_totals(
     totals_row = _find_label_row(ws, "Всего операций")
     if not totals_row:
         return result
+
+    protected: Optional[int] = None
     if protected_last_category_row is not None:
         try:
             p = int(protected_last_category_row)
         except (TypeError, ValueError):
             p = None
-        # Если защита выглядит валидной, не полагаемся на значения в колонке B:
-        # иначе можно удалить строки категорий, где в шаблоне текст пустой.
         if p is not None and 3 <= p < int(totals_row):
-            last_cat = p
-        else:
-            last_cat = _last_category_row_before(ws, totals_row)
-    else:
-        last_cat = _last_category_row_before(ws, totals_row)
+            protected = p
+
+    # Gap всегда по фактическим подписям в B (не по номерам из config).
+    last_cat = _last_category_row_before(ws, totals_row)
     if last_cat is None:
         return result
     gap = totals_row - last_cat - 1
@@ -301,7 +424,7 @@ def ensure_one_blank_before_totals(
     # gap < desired — вставлять строки прямо перед итогами
     if gap < desired_blank_count:
         need = desired_blank_count - gap
-        ws.insert_rows(totals_row, amount=need)
+        sheet_insert_rows(ws, totals_row, amount=need)
         bump_sheet_formulas(ws, totals_row, need)
         bump_chart_refs(ws, totals_row, need)
         result["inserted"] = need
@@ -321,11 +444,14 @@ def ensure_one_blank_before_totals(
         if gap <= desired_blank_count:
             break
         del_row = totals_row - 1
+        # Не удаляем строки категорий даже с пустым B (частичная вставка / фантом config).
+        if protected is not None and del_row <= protected:
+            break
         v = ws.cell(del_row, 2).value
         # Удаляем только реально пустые строки (иначе можно срезать категорию)
         if v is not None and str(v).strip():
             break
-        ws.delete_rows(del_row, amount=1)
+        sheet_delete_rows(ws, del_row, amount=1)
         bump_sheet_formulas(ws, del_row + 1, -1)
         bump_chart_refs(ws, del_row + 1, -1)
         result["deleted"] += 1
@@ -336,6 +462,7 @@ def ensure_one_blank_before_totals(
     last_cat = _last_category_row_before(ws, totals_row) if totals_row else None
     if last_cat is not None and desired_blank_count:
         result["blank_at"] = last_cat + 1
+    fix_patients_row_height(ws)
     return result
 
 
@@ -364,7 +491,7 @@ def ensure_one_blank_between_labels(
         return result
 
     if gap == 0:
-        ws.insert_rows(bottom_row, amount=1)
+        sheet_insert_rows(ws, bottom_row, amount=1)
         bump_sheet_formulas(ws, bottom_row, 1)
         bump_chart_refs(ws, bottom_row, 1)
         result["inserted"] = 1
@@ -386,7 +513,7 @@ def ensure_one_blank_between_labels(
         if v is not None and str(v).strip():
             # не трогаем строки, где B не пустая (на всякий случай)
             break
-        ws.delete_rows(del_row, amount=1)
+        sheet_delete_rows(ws, del_row, amount=1)
         bump_sheet_formulas(ws, del_row + 1, -1)
         bump_chart_refs(ws, del_row + 1, -1)
         result["deleted"] += 1
@@ -769,7 +896,7 @@ def add_category_row_to_summary(
     patients_blank_delta_set = False
     for name in month_sheets:
         ws = wb[name]
-        ws.insert_rows(insert_at, amount=1)
+        sheet_insert_rows(ws, insert_at, amount=1)
         report["formulas"]["bumped"] += bump_sheet_formulas(ws, insert_at, 1)
         report["formulas"]["bumped"] += bump_chart_refs(ws, insert_at, 1)
         _fill_month_category_row(ws, insert_at, category_name, kind)
@@ -806,7 +933,7 @@ def add_category_row_to_summary(
         if not role:
             continue
         ws = wb[sheet_name]
-        ws.insert_rows(insert_at, amount=1)
+        sheet_insert_rows(ws, insert_at, amount=1)
         report["formulas"]["bumped"] += bump_sheet_formulas(ws, insert_at, 1)
         report["formulas"]["bumped"] += bump_chart_refs(ws, insert_at, 1)
         _fill_overview_row(
@@ -1005,7 +1132,7 @@ def delete_category_row_from_summary(
         ws = wb[name]
         report["charts_removed"] += _remove_chart_series_for_row(ws, delete_at)
         report["stripped"] += _strip_row_refs_on_sheet(ws, delete_at)
-        ws.delete_rows(delete_at, amount=1)
+        sheet_delete_rows(ws, delete_at, amount=1)
         report["bumped"] += bump_sheet_formulas(ws, delete_at + 1, -1)
         report["bumped"] += bump_chart_refs(ws, delete_at + 1, -1)
         gap = ensure_one_blank_before_totals(ws)

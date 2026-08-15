@@ -320,26 +320,133 @@ def test_ensure_one_blank_before_totals_trims_extras(tmp_path: Path):
 
 def test_ensure_one_blank_before_totals_protected_row_avoids_deleting_categories(tmp_path: Path):
     """
-    Регрессия: если последняя категория в шаблоне в колонке B временно пустая,
-    прежняя логика могла удалить строку категории при нормализации разделителя.
+    protected_last не даёт удалить «слот» категории с пустым B при обрезке лишних blank.
+    Gap/insert считаются по последней непустой метке в B.
     """
     from analyzers.summary_layout import ensure_one_blank_before_totals
 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws["B37"] = "А"
-    ws["B40"] = "Всего операций"
-    # категория на 38, но в шаблоне B38 пустая (например после частичной вставки)
+    # «слот» категории на 38 без названия + 4 пустые перед итогами
+    ws["B38"] = None
     ws["B39"] = None
+    ws["B40"] = None
+    ws["B41"] = None
+    ws["B42"] = "Всего операций"
 
     gap = ensure_one_blank_before_totals(ws, protected_last_category_row=38)
-    # Если последняя категория в реальности на 38, то нужно 2 пустые строки:
-    # между 38 и 40 сейчас только одна пустая (39), поэтому вставим одну строку.
-    assert gap["deleted"] == 0
-    assert gap["inserted"] == 1
+    assert gap["deleted"] >= 1
+    # строка 38 не удалена (protected), перед «Всего» ровно 2 пустые от последней подписи (37)
+    assert ws["B37"].value == "А"
+    totals = None
+    for r in range(1, 50):
+        if ws.cell(r, 2).value == "Всего операций":
+            totals = r
+            break
+    assert totals == 40
+    assert ws["B38"].value in (None, "")
     assert ws["B39"].value in (None, "")
-    assert ws["B40"].value in (None, "")
-    assert ws["B41"].value == "Всего операций"
+
+
+def test_ensure_one_blank_ignores_phantom_config_rows_for_insert():
+    """
+    Регрессия файла «(3).xlsx»: category_rows 38/39 в config без названий в Excel.
+    Старый код считал last_cat=39 → gap=0 → вставлял ещё 2 пустые вместо операций.
+    """
+    from analyzers.summary_layout import ensure_one_blank_before_totals
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["B37"] = "Биопсия гортани "
+    ws["B38"] = None
+    ws["B39"] = None
+    ws["B40"] = "Всего операций"
+
+    gap = ensure_one_blank_before_totals(ws, protected_last_category_row=39)
+    assert gap["inserted"] == 0
+    assert gap["deleted"] == 0
+    assert ws["B40"].value == "Всего операций"
+    assert ws["B38"].value in (None, "")
+    assert ws["B39"].value in (None, "")
+
+
+def test_insert_rows_shifts_row_height_with_labels():
+    """Высота строки должна ехать вместе с меткой (не «прилипать» к номеру)."""
+    from analyzers.summary_layout import sheet_insert_rows
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["B43"] = "Дети всего"
+    ws["B45"] = "Человек"
+    ws.row_dimensions[45].height = 51.0
+
+    sheet_insert_rows(ws, 40, amount=2)
+
+    assert ws["B45"].value == "Дети всего"
+    assert ws["B47"].value == "Человек"
+    assert not ws.row_dimensions[45].height
+    assert ws.row_dimensions[47].height == 51.0
+
+
+def test_fix_patients_row_height_moves_from_children():
+    from analyzers.summary_layout import fix_patients_row_height
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["B45"] = "Дети всего"
+    ws["B47"] = "Человек"
+    ws.row_dimensions[45].height = 51.0
+
+    assert fix_patients_row_height(ws) is True
+    assert not ws.row_dimensions[45].height
+    assert ws.row_dimensions[47].height == 51.0
+
+
+def test_sheet_delete_rows_shifts_height_up():
+    from analyzers.summary_layout import sheet_delete_rows, shift_row_dimensions
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws["B40"] = "blank-slot"
+    ws["B45"] = "Человек"
+    ws.row_dimensions[45].height = 51.0
+    ws.row_dimensions[30].height = 18.0  # выше точки удаления — не трогаем номер логикой insert
+
+    assert shift_row_dimensions(ws, 40, 0) == 0
+    sheet_delete_rows(ws, 40, amount=1)
+
+    assert ws["B44"].value == "Человек"
+    assert ws.row_dimensions[44].height == 51.0
+    assert not ws.row_dimensions[45].height
+    assert ws.row_dimensions[30].height == 18.0
+
+
+def test_fix_patients_row_height_noop_cases():
+    from analyzers.summary_layout import fix_patients_row_height
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    assert fix_patients_row_height(ws) is False
+
+    ws["B45"] = "Дети всего"
+    ws["B47"] = "Человек"
+    ws.row_dimensions[45].height = 15.0  # не «высокая»
+    assert fix_patients_row_height(ws) is False
+
+    ws.row_dimensions[45].height = 51.0
+    ws.row_dimensions[47].height = 51.0  # у Человек уже высокая
+    assert fix_patients_row_height(ws) is False
+
+
+def test_shift_row_dimensions_empty_snapshot():
+    from analyzers.summary_layout import shift_row_dimensions
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    # без явных height ключей dims может быть пуст
+    assert shift_row_dimensions(ws, 5, 1) == 0
+    assert shift_row_dimensions(ws, 5, -1) == 0
 
 
 def test_ensure_one_blank_between_labels_inserts_gap_when_missing(tmp_path: Path):
